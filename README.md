@@ -22,6 +22,30 @@ Before running the bot, ensure you have the following:
 
 ---
 
+## Wallet Creation & Encryption Type
+
+This bot supports both cryptographic signature schemes on the XRP Ledger: **secp256k1** (seeds start with `s`) and **ed25519** (seeds start with `sEd`). 
+
+By default, the `xrpl-py` SDK utilizes the **Ed25519** algorithm, which is highly recommended for faster and more secure transaction signing on the XRPL.
+
+### How to generate a new Ed25519 wallet using Python:
+You can generate a new wallet and its corresponding seed by running the following Python script:
+
+```python
+from xrpl.wallet import Wallet
+from xrpl.wallet import CryptoAlgorithm
+
+# Generate a new wallet using the default Ed25519 algorithm
+wallet = Wallet.create(CryptoAlgorithm.ED25519)
+
+print("Classic Address:", wallet.classic_address)
+print("Secret Seed:    ", wallet.seed)  # Will start with the 'sEd' prefix
+```
+
+Copy the generated `Secret Seed` and paste it as `XRPL_SEED` in your `.env`. Make sure to fund the `Classic Address` on-ledger with enough XRP to cover the account activation reserve (10 XRP base reserve) plus NFT holding reserves (0.2 XRP per item).
+
+---
+
 ## Setup & Configuration
 
 1. Copy the template configuration file to create your local `.env`:
