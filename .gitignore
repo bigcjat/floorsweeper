@@ -1,0 +1,11 @@
+.env
+*.log
+vanity_wallet.txt
+scratch/
+.DS_Store
+__pycache__/
+*.pyc
+dropchan_ranks.json
+dropchan_ranks.js
+rarities.json
+rarity.html
