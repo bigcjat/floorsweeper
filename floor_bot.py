@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 # XRPL SDK imports
 from xrpl.clients import JsonRpcClient
 from xrpl.wallet import Wallet
-from xrpl.models.requests import AccountNFTs, NFTSellOffers, AccountObjects, AccountTx
+from xrpl.models.requests import AccountNFTs, NFTSellOffers, AccountObjects, AccountTx, Fee
 from xrpl.models.transactions import (
     NFTokenAcceptOffer,
     NFTokenCreateOffer,
@@ -42,6 +42,8 @@ BROKER_FEE_MULTIPLIER = float(os.getenv("BROKER_FEE_MULTIPLIER", "1.01589"))
 MAX_ACTIVE_BUYS = int(os.getenv("MAX_ACTIVE_BUYS", "4"))
 BUY_OFFER_EXPIRATION_SEC = int(os.getenv("BUY_OFFER_EXPIRATION_SEC", "600"))
 RELIST_MARKUP_DIVISOR = float(os.getenv("RELIST_MARKUP_DIVISOR", "0.9"))
+BASE_FEE_DROPS = int(os.getenv("BASE_FEE_DROPS", "12"))
+MAX_FEE_DROPS = int(os.getenv("MAX_FEE_DROPS", "1200"))
 
 # Convert XRP to drops
 TARGET_BUY_FLOOR_DROPS = int(TARGET_BUY_FLOOR_XRP * 1_000_000)
@@ -59,6 +61,8 @@ print(f"Broker Fee Mult:{BROKER_FEE_MULTIPLIER}")
 print(f"Max Active Buys:{MAX_ACTIVE_BUYS}")
 print(f"Buy Expiration:{BUY_OFFER_EXPIRATION_SEC} seconds")
 print(f"Relist Divisor:{RELIST_MARKUP_DIVISOR}")
+print(f"Base Fee:      {BASE_FEE_DROPS} drops")
+print(f"Max Fee Limit: {MAX_FEE_DROPS} drops")
 print(f"Dry Run Mode:  {DRY_RUN}")
 print(f"Poll Interval: {POLL_INTERVAL} seconds")
 
@@ -89,6 +93,31 @@ try:
 except Exception as e:
     print(f"[CRITICAL ERROR] Failed to connect to XRPL node {XRPL_NODE}: {e}")
     sys.exit(1)
+
+def get_current_fee_drops(client_obj):
+    """
+    Fetch the current open ledger transaction fee (in drops) from the node.
+    """
+    try:
+        response = client_obj.request(Fee())
+        if response.is_successful():
+            drops = response.result.get("drops", {})
+            open_ledger_fee = int(drops.get("open_ledger_fee", 10))
+            return open_ledger_fee
+    except Exception as e:
+        print(f"[Warning] Failed to fetch fee from ledger: {e}")
+    return None
+
+def calculate_tx_fee():
+    """
+    Determine the fee to use for the next transaction, respecting bounds.
+    """
+    current_fee = get_current_fee_drops(client)
+    if current_fee is None:
+        return str(BASE_FEE_DROPS)
+    
+    fee_to_pay = max(BASE_FEE_DROPS, min(current_fee, MAX_FEE_DROPS))
+    return str(fee_to_pay)
 
 def fetch_api_sell_offers():
     """
@@ -142,7 +171,8 @@ def execute_direct_buy(offer_id, nftoken_id, price_drops):
 
     tx = NFTokenAcceptOffer(
         account=wallet.classic_address,
-        nftoken_sell_offer=offer_id
+        nftoken_sell_offer=offer_id,
+        fee=calculate_tx_fee()
     )
     
     if DRY_RUN:
@@ -186,8 +216,9 @@ def execute_brokered_buy(owner_address, nftoken_id, price_drops):
         nftoken_id=nftoken_id,
         amount=str(bid_amount),
         owner=owner_address,
-        expiration=expiration_time
+        expiration=expiration_time,
         # No tfSellNFToken flag implies this is a Buy Offer
+        fee=calculate_tx_fee()
     )
     
     if DRY_RUN:
@@ -217,7 +248,8 @@ def create_sell_offer(nftoken_id, price_drops):
         account=wallet.classic_address,
         nftoken_id=nftoken_id,
         amount=str(price_drops),
-        flags=[NFTokenCreateOfferFlag.TF_SELL_NFTOKEN]
+        flags=[NFTokenCreateOfferFlag.TF_SELL_NFTOKEN],
+        fee=calculate_tx_fee()
     )
     
     if DRY_RUN:
@@ -253,7 +285,8 @@ def cancel_sell_offer(offer_id, nftoken_id):
     
     tx = NFTokenCancelOffer(
         account=wallet.classic_address,
-        nftoken_offers=[offer_id]
+        nftoken_offers=[offer_id],
+        fee=calculate_tx_fee()
     )
     
     if DRY_RUN:
@@ -412,7 +445,8 @@ def validate_and_cleanup_offers(api_data):
     if offers_to_cancel:
         tx = NFTokenCancelOffer(
             account=wallet.classic_address,
-            nftoken_offers=offers_to_cancel
+            nftoken_offers=offers_to_cancel,
+            fee=calculate_tx_fee()
         )
         if not DRY_RUN:
             try:

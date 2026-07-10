@@ -14,7 +14,7 @@ Before running the bot, ensure you have the following:
 
 1. **Python 3.7+**
 2. **A Funded XRPL Wallet**: You need a wallet funded with XRP to cover transactions, buy offers, and ledger object reserves.
-   * *Note: The ledger locks up `0.2 XRP` in reserve for each NFT held and for each active sell/buy offer. Ensure you have sufficient liquid XRP beyond the target purchase prices.*
+   * *Note: The ledger locks up `0.2 XRP` owner reserve per active sell/buy offer. For NFT storage, the ledger uses `NFTokenPage` objects which host up to 32 NFTs each; each page adds a `0.2 XRP` owner reserve (rather than 0.2 XRP per individual NFT). Ensure you have sufficient liquid XRP beyond your target purchase prices.*
 3. **Required Packages**: Install the XRPL Python SDK and environment variables loader:
    ```bash
    pip install xrpl-py python-dotenv requests
@@ -42,7 +42,7 @@ print("Classic Address:", wallet.classic_address)
 print("Secret Seed:    ", wallet.seed)  # Will start with the 'sEd' prefix
 ```
 
-Copy the generated `Secret Seed` and paste it as `XRPL_SEED` in your `.env`. Make sure to fund the `Classic Address` on-ledger with enough XRP to cover the account activation reserve (10 XRP base reserve) plus NFT holding reserves (0.2 XRP per item).
+Copy the generated `Secret Seed` and paste it as `XRPL_SEED` in your `.env`. Make sure to fund the `Classic Address` on-ledger with enough XRP to cover the account activation reserve (1 XRP base reserve), active offer reserves (0.2 XRP per offer), and NFT page reserves (0.2 XRP per 32 items).
 
 ---
 
