@@ -8,6 +8,16 @@ This automated bot runs in the background to monitor a specific XLS-20 NFT colle
 
 ---
 
+## Key Performance & Architecture Features
+
+* **Fully Asynchronous Execution**: Built using `asyncio` and `httpx` to execute network operations in parallel, drastically reducing execution latency.
+* **Multi-Sweep & Concurrency**: Sweeps and lists multiple NFTs in parallel by utilizing XRPL **Tickets**. This allows the bot to process transactions simultaneously without sequence collisions.
+* **Auto-Replenishing Ticket Engine**: Monitors your wallet's ticket count. When active tickets drop below 5, it submits a batched `TicketCreate` transaction to top the pool back up to 30. Safely falls back to standard sequential account sequence numbers if tickets cannot be created.
+* **Persistent Clio History Cache**: Caches Clio transaction histories locally in `purchase_price_cache.json`. This reduces startup overhead, completely prevents public node rate-limiting (`503 Service Unavailable` errors), and reduces inventory validation checks to under a second.
+* **Dynamic Fee Bounding**: Dynamically queries ledger transaction fees once per cycle to automatically scale transaction fees safely during network congestion.
+
+---
+
 ## Prerequisites
 
 Before running the bot, ensure you have the following:
@@ -78,6 +88,9 @@ Copy the generated `Secret Seed` and paste it as `XRPL_SEED` in your `.env`. Mak
 * `AUTO_RELIST`: Whether to automatically list swept/bought NFTs for sale (default is `True`). Set to `False` to run the bot in "sweeping-only" mode where it only sweeps cheap NFTs without placing sell offers or managing listing prices.
 * `PRIORITY_BUY_IDS`: A comma-separated list of NFTokenIDs. If any matching NFTs are listed below your target buy ceiling, the bot will prioritize purchasing them first, even if they aren't the cheapest NFTs in the collection.
 * `HOLD_IDS`: A comma-separated list of NFTokenIDs. The bot will never automatically list/relist these NFTs for sale, and it will never automatically cancel active buy offers (bids) placed on them, allowing you to secure and hold them.
+* `BASE_FEE_DROPS`: The baseline transaction fee (default is `12` drops).
+* `MAX_FEE_DROPS`: The maximum transaction fee you are willing to pay during network fee escalation (default is `1200` drops).
+
 
 ---
 

@@ -1,21 +1,23 @@
 import os
 import sys
 import json
+import asyncio
 import time
-import requests
+import httpx
 from dotenv import load_dotenv
 
 # XRPL SDK imports
-from xrpl.clients import JsonRpcClient
+from xrpl.asyncio.clients import AsyncJsonRpcClient
 from xrpl.wallet import Wallet
-from xrpl.models.requests import AccountNFTs, NFTSellOffers, AccountObjects, AccountTx, Fee
+from xrpl.models.requests import AccountNFTs, NFTSellOffers, AccountObjects, Fee, AccountObjectType
 from xrpl.models.transactions import (
     NFTokenAcceptOffer,
     NFTokenCreateOffer,
     NFTokenCreateOfferFlag,
-    NFTokenCancelOffer
+    NFTokenCancelOffer,
+    TicketCreate
 )
-from xrpl.transaction import submit_and_wait
+from xrpl.asyncio.transaction import submit_and_wait
 
 # Load environment variables
 load_dotenv()
@@ -69,8 +71,34 @@ MAX_FEE_DROPS = int(os.getenv("MAX_FEE_DROPS", "1200"))
 TARGET_BUY_FLOOR_DROPS = int(TARGET_BUY_FLOOR_XRP * 1_000_000)
 TARGET_SELL_FLOOR_DROPS = int(TARGET_SELL_FLOOR_XRP * 1_000_000)
 
-# In-memory cache to prevent redundant on-ledger history scans
+# In-memory and persistent cache to prevent redundant on-ledger history scans
+CACHE_FILE = "purchase_price_cache.json"
 PURCHASE_PRICE_CACHE = {}
+
+def load_purchase_price_cache():
+    global PURCHASE_PRICE_CACHE
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r") as f:
+                PURCHASE_PRICE_CACHE = json.load(f)
+            print(f"[Cache] Loaded {len(PURCHASE_PRICE_CACHE)} cached purchase prices from '{CACHE_FILE}'.")
+        except Exception as e:
+            print(f"[Cache Warning] Failed to load cache file: {e}")
+            PURCHASE_PRICE_CACHE = {}
+    else:
+        PURCHASE_PRICE_CACHE = {}
+
+def save_purchase_price_cache():
+    try:
+        with open(CACHE_FILE, "w") as f:
+            json.dump(PURCHASE_PRICE_CACHE, f, indent=2)
+    except Exception as e:
+        print(f"[Cache Warning] Failed to save cache file: {e}")
+
+load_purchase_price_cache()
+
+# Ticket queue state
+AVAILABLE_TICKETS = []
 
 print("=" * 80)
 print("              XRPL NFT FLOOR SWEEPER & RELISTING BOT")
@@ -113,39 +141,136 @@ else:
         print(f"\n[CRITICAL ERROR] Failed to initialize wallet from seed: {e}")
         sys.exit(1)
 
-# Establish XRPL client
-try:
-    client = JsonRpcClient(XRPL_NODE)
-except Exception as e:
-    print(f"[CRITICAL ERROR] Failed to connect to XRPL node {XRPL_NODE}: {e}")
-    sys.exit(1)
-
-def get_current_fee_drops(client_obj):
+# Ticket pool management
+async def get_available_tickets(client_obj):
     """
-    Fetch the current open ledger transaction fee (in drops) from the node.
+    Query the ledger for all available tickets owned by our account.
     """
+    tickets = []
+    marker = None
     try:
-        response = client_obj.request(Fee())
+        while True:
+            req = AccountObjects(
+                account=wallet.classic_address,
+                type=AccountObjectType.TICKET,
+                marker=marker
+            )
+            resp = await client_obj.request(req)
+            if resp.is_successful():
+                objects = resp.result.get("account_objects", [])
+                for obj in objects:
+                    tickets.append(int(obj.get("TicketSequence")))
+                marker = resp.result.get("marker")
+                if not marker:
+                    break
+            else:
+                break
+    except Exception as e:
+        print(f"[Tickets Warning] Failed to query tickets: {e}")
+    return sorted(tickets)
+
+async def ensure_ticket_pool(client_obj):
+    """
+    Check if available tickets are low and replenish the pool if necessary.
+    """
+    global AVAILABLE_TICKETS
+    AVAILABLE_TICKETS = await get_available_tickets(client_obj)
+    
+    # If tickets are low, top them up (target pool size: 30 tickets)
+    if len(AVAILABLE_TICKETS) < 5:
+        from xrpl.models.requests import AccountInfo
+        try:
+            resp = await client_obj.request(AccountInfo(account=wallet.classic_address))
+            if resp.is_successful():
+                account_data = resp.result.get("account_data", {})
+                seq = account_data.get("Sequence")
+                tickets_needed = 30 - len(AVAILABLE_TICKETS)
+                print(f"[Tickets] Ticket pool low ({len(AVAILABLE_TICKETS)} active). Creating {tickets_needed} new tickets...")
+                
+                tx = TicketCreate(
+                    account=wallet.classic_address,
+                    ticket_count=tickets_needed,
+                    sequence=seq,
+                    fee=calculate_tx_fee()
+                )
+                
+                if DRY_RUN:
+                    print(f"[DRY RUN] Would submit TicketCreate for {tickets_needed} tickets.")
+                    # Simulate tickets locally
+                    start_seq = seq + 1
+                    AVAILABLE_TICKETS.extend(range(start_seq, start_seq + tickets_needed))
+                    return
+                    
+                resp_tx = await submit_and_wait(tx, client_obj, wallet)
+                if resp_tx.is_successful() and resp_tx.result.get("meta", {}).get("TransactionResult") == "tesSUCCESS":
+                    print(f"[Success] Created {tickets_needed} new tickets.")
+                    AVAILABLE_TICKETS = await get_available_tickets(client_obj)
+                else:
+                    print(f"[Tickets Error] TicketCreate failed: {resp_tx.result.get('meta', {}).get('TransactionResult')}")
+        except Exception as e:
+            print(f"[Tickets Error] Failed to create tickets: {e}")
+
+async def get_next_ticket(client_obj):
+    """
+    Pop the next ticket from the queue. Top up if empty.
+    """
+    global AVAILABLE_TICKETS
+    if not AVAILABLE_TICKETS:
+        try:
+            await ensure_ticket_pool(client_obj)
+        except Exception:
+            pass
+    if AVAILABLE_TICKETS:
+        return AVAILABLE_TICKETS.pop(0)
+    return None
+
+async def get_tx_sequence_and_ticket(client_obj):
+    """
+    Get the next sequence or ticket sequence to use for a transaction.
+    Returns (sequence, ticket_sequence) tuple.
+    """
+    ticket = await get_next_ticket(client_obj)
+    if ticket is not None:
+        return 0, ticket
+        
+    # Fallback to standard sequence
+    from xrpl.models.requests import AccountInfo
+    try:
+        resp = await client_obj.request(AccountInfo(account=wallet.classic_address))
+        if resp.is_successful():
+            seq = resp.result.get("account_data", {}).get("Sequence")
+            return seq, None
+    except Exception as e:
+        print(f"[Warning] Failed to fetch standard sequence: {e}")
+    return None, None
+
+CURRENT_TX_FEE_DROPS = str(BASE_FEE_DROPS)
+
+async def update_current_fee(client_obj):
+    """
+    Fetch the current open ledger transaction fee (in drops) from the node
+    and update our global variable.
+    """
+    global CURRENT_TX_FEE_DROPS
+    try:
+        response = await client_obj.request(Fee())
         if response.is_successful():
             drops = response.result.get("drops", {})
             open_ledger_fee = int(drops.get("open_ledger_fee", 10))
-            return open_ledger_fee
+            fee_to_pay = max(BASE_FEE_DROPS, min(open_ledger_fee, MAX_FEE_DROPS))
+            CURRENT_TX_FEE_DROPS = str(fee_to_pay)
+            return
     except Exception as e:
         print(f"[Warning] Failed to fetch fee from ledger: {e}")
-    return None
+    CURRENT_TX_FEE_DROPS = str(BASE_FEE_DROPS)
 
 def calculate_tx_fee():
     """
-    Determine the fee to use for the next transaction, respecting bounds.
+    Return the cached transaction fee.
     """
-    current_fee = get_current_fee_drops(client)
-    if current_fee is None:
-        return str(BASE_FEE_DROPS)
-    
-    fee_to_pay = max(BASE_FEE_DROPS, min(current_fee, MAX_FEE_DROPS))
-    return str(fee_to_pay)
+    return CURRENT_TX_FEE_DROPS
 
-def fetch_api_sell_offers():
+async def fetch_api_sell_offers(http_client):
     """
     Fetch active offers for the collection from XRP Ledger Services.
     """
@@ -155,27 +280,26 @@ def fetch_api_sell_offers():
         headers["x-api-key"] = XRP_API_KEY
     
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        response = await http_client.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         return response.json()
     except Exception as e:
         print(f"[API Error] Failed to fetch collection offers: {e}")
         return None
 
-def get_free_balance():
+async def get_free_balance(client_obj):
     """
     Calculate the liquid/free XRP balance of the wallet in drops,
     subtracting base (1.0 XRP) and owner reserves (0.2 XRP per object).
     """
     try:
         from xrpl.models.requests import AccountInfo
-        resp = client.request(AccountInfo(account=wallet.classic_address))
+        resp = await client_obj.request(AccountInfo(account=wallet.classic_address))
         if resp.is_successful():
             data = resp.result.get("account_data", {})
             balance = int(data.get("Balance", 0))
             owner_count = int(data.get("OwnerCount", 0))
             
-            # Current XRPL mainnet reserves: 1.0 XRP base, 0.2 XRP per owner object
             base_reserve = 1_000_000  # 1.0 XRP in drops
             owner_reserve = 200_000   # 0.2 XRP in drops
             
@@ -186,27 +310,29 @@ def get_free_balance():
         print(f"[Warning] Failed to calculate free balance: {e}")
     return 0
 
-def execute_direct_buy(offer_id, nftoken_id, price_drops):
+async def execute_direct_buy(client_obj, offer_id, nftoken_id, price_drops):
     """
     Purchase an NFT directly from a public sell offer.
     """
-    # Hard Safety Limit: Never buy for more than the target buy floor under any circumstances
     if price_drops > TARGET_BUY_FLOOR_DROPS:
         print(f"[CRITICAL SAFETY TRIGGERED] Blocked direct buy attempt of {price_drops / 1_000_000} XRP which exceeds absolute safety limit of {TARGET_BUY_FLOOR_XRP} XRP.")
         return False, 0
 
+    seq, ticket = await get_tx_sequence_and_ticket(client_obj)
     tx = NFTokenAcceptOffer(
         account=wallet.classic_address,
         nftoken_sell_offer=offer_id,
+        sequence=seq,
+        ticket_sequence=ticket,
         fee=calculate_tx_fee()
     )
     
     if DRY_RUN:
-        print(f"[DRY RUN] Would submit NFTokenAcceptOffer for SellOfferID: {offer_id}")
+        print(f"[DRY RUN] Would submit NFTokenAcceptOffer (Ticket: {ticket}) for SellOfferID: {offer_id}")
         return True, price_drops
     
     try:
-        response = submit_and_wait(tx, client, wallet)
+        response = await submit_and_wait(tx, client_obj, wallet)
         if response.is_successful() and response.result.get("meta", {}).get("TransactionResult") == "tesSUCCESS":
             print(f"[Success] Successfully purchased NFT {nftoken_id}!")
             return True, price_drops
@@ -218,14 +344,12 @@ def execute_direct_buy(offer_id, nftoken_id, price_drops):
         print(f"[Error] Transaction submission failed: {e}")
         return False, 0
 
-def execute_brokered_buy(owner_address, nftoken_id, price_drops, broker_fee_mult):
+async def execute_brokered_buy(client_obj, owner_address, nftoken_id, price_drops, broker_fee_mult):
     """
     Create a Buy Offer for a marketplace listing to trigger the broker match.
     """
-    # We bid the listing price + the broker fee required by the marketplace broker
     bid_amount = int(price_drops * broker_fee_mult)
     
-    # Hard Safety Limit: Never place a buy bid for more than the target buy floor under any circumstances
     if bid_amount > TARGET_BUY_FLOOR_DROPS:
         print(f"[CRITICAL SAFETY TRIGGERED] Blocked brokered buy bid of {bid_amount / 1_000_000} XRP which exceeds absolute safety limit of {TARGET_BUY_FLOOR_XRP} XRP.")
         return False, 0
@@ -237,22 +361,24 @@ def execute_brokered_buy(owner_address, nftoken_id, price_drops, broker_fee_mult
     ripple_time = int(time.time()) - RIPPLE_EPOCH
     expiration_time = ripple_time + BUY_OFFER_EXPIRATION_SEC
     
+    seq, ticket = await get_tx_sequence_and_ticket(client_obj)
     tx = NFTokenCreateOffer(
         account=wallet.classic_address,
         nftoken_id=nftoken_id,
         amount=str(bid_amount),
         owner=owner_address,
         expiration=expiration_time,
-        # No tfSellNFToken flag implies this is a Buy Offer
+        sequence=seq,
+        ticket_sequence=ticket,
         fee=calculate_tx_fee()
     )
     
     if DRY_RUN:
-        print(f"[DRY RUN] Would submit NFTokenCreateOffer (Buy) for NFT {nftoken_id} with amount {bid_amount} drops to owner {owner_address}")
+        print(f"[DRY RUN] Would submit NFTokenCreateOffer Buy (Ticket: {ticket}) for NFT {nftoken_id} with amount {bid_amount} drops to owner {owner_address}")
         return True, bid_amount
     
     try:
-        response = submit_and_wait(tx, client, wallet)
+        response = await submit_and_wait(tx, client_obj, wallet)
         if response.is_successful() and response.result.get("meta", {}).get("TransactionResult") == "tesSUCCESS":
             print(f"[Success] Created Buy Offer for NFT {nftoken_id}. Waiting for broker matching...")
             return True, bid_amount
@@ -264,26 +390,29 @@ def execute_brokered_buy(owner_address, nftoken_id, price_drops, broker_fee_mult
         print(f"[Error] Transaction submission failed: {e}")
         return False, 0
 
-def create_sell_offer(nftoken_id, price_drops):
+async def create_sell_offer(client_obj, nftoken_id, price_drops):
     """
     Create a Sell Offer to list our NFT.
     """
     print(f"[Sell] Creating Sell Offer for NFT {nftoken_id} at {price_drops / 1_000_000} XRP...")
     
+    seq, ticket = await get_tx_sequence_and_ticket(client_obj)
     tx = NFTokenCreateOffer(
         account=wallet.classic_address,
         nftoken_id=nftoken_id,
         amount=str(price_drops),
         flags=NFTokenCreateOfferFlag.TF_SELL_NFTOKEN,
+        sequence=seq,
+        ticket_sequence=ticket,
         fee=calculate_tx_fee()
     )
     
     if DRY_RUN:
-        print(f"[DRY RUN] Would submit NFTokenCreateOffer (Sell) for NFT {nftoken_id} at {price_drops} drops")
+        print(f"[DRY RUN] Would submit NFTokenCreateOffer Sell (Ticket: {ticket}) for NFT {nftoken_id} at {price_drops} drops")
         return "DRY_RUN_OFFER_ID"
     
     try:
-        response = submit_and_wait(tx, client, wallet)
+        response = await submit_and_wait(tx, client_obj, wallet)
         if response.is_successful() and response.result.get("meta", {}).get("TransactionResult") == "tesSUCCESS":
             affected_nodes = response.result.get("meta", {}).get("AffectedNodes", [])
             offer_id = None
@@ -303,24 +432,27 @@ def create_sell_offer(nftoken_id, price_drops):
         print(f"[Error] Transaction submission failed: {e}")
         return None
 
-def cancel_sell_offer(offer_id, nftoken_id):
+async def cancel_sell_offer(client_obj, offer_id, nftoken_id):
     """
     Cancel an existing Sell Offer.
     """
     print(f"[Cancel] Canceling active sell offer {offer_id} for NFT {nftoken_id}...")
     
+    seq, ticket = await get_tx_sequence_and_ticket(client_obj)
     tx = NFTokenCancelOffer(
         account=wallet.classic_address,
         nftoken_offers=[offer_id],
+        sequence=seq,
+        ticket_sequence=ticket,
         fee=calculate_tx_fee()
     )
     
     if DRY_RUN:
-        print(f"[DRY RUN] Would submit NFTokenCancelOffer for Offer ID: {offer_id}")
+        print(f"[DRY RUN] Would submit NFTokenCancelOffer (Ticket: {ticket}) for Offer ID: {offer_id}")
         return True
     
     try:
-        response = submit_and_wait(tx, client, wallet)
+        response = await submit_and_wait(tx, client_obj, wallet)
         if response.is_successful() and response.result.get("meta", {}).get("TransactionResult") == "tesSUCCESS":
             print(f"[Success] Cancelled sell offer {offer_id}.")
             return True
@@ -332,20 +464,20 @@ def cancel_sell_offer(offer_id, nftoken_id):
         print(f"[Error] Transaction submission failed: {e}")
         return False
 
-def check_owned_nfts_sell_offers(nft_id):
+async def check_owned_nfts_sell_offers(client_obj, nft_id):
     """
     Get all active sell offers on the ledger for an NFT.
     """
     try:
         request = NFTSellOffers(nft_id=nft_id)
-        response = client.request(request)
+        response = await client_obj.request(request)
         if response.is_successful():
             return response.result.get("offers", [])
     except Exception as e:
         pass
     return []
 
-def validate_and_cleanup_offers(api_data):
+async def validate_and_cleanup_offers(client_obj, api_data):
     """
     Validate all our active sell and buy offers on-ledger:
     1. Cancel sell offers for NFTs we no longer own (orphans).
@@ -359,7 +491,7 @@ def validate_and_cleanup_offers(api_data):
         marker = None
         while True:
             request = AccountNFTs(account=wallet.classic_address, marker=marker)
-            response = client.request(request)
+            response = await client_obj.request(request)
             if response.is_successful():
                 owned_nfts.extend(response.result.get("account_nfts", []))
                 marker = response.result.get("marker")
@@ -367,15 +499,15 @@ def validate_and_cleanup_offers(api_data):
                     break
             else:
                 print(f"[Validation Error] Failed to fetch owned NFTs: {response.result}")
-                return
+                return []
         owned_ids = {n.get("NFTokenID") for n in owned_nfts if n.get("Issuer") == ISSUER and n.get("NFTokenTaxon") == TAXON}
 
         # 2. Fetch all our active offers on-ledger
         objects = []
         marker = None
         while True:
-            request = AccountObjects(account=wallet.classic_address, type="nft_offer", marker=marker)
-            response = client.request(request)
+            request = AccountObjects(account=wallet.classic_address, type=AccountObjectType.NFT_OFFER, marker=marker)
+            response = await client_obj.request(request)
             if response.is_successful():
                 objects.extend(response.result.get("account_objects", []))
                 marker = response.result.get("marker")
@@ -383,10 +515,10 @@ def validate_and_cleanup_offers(api_data):
                     break
             else:
                 print(f"[Validation Error] Failed to fetch active offers: {response.result}")
-                return
+                return []
     except Exception as e:
         print(f"[Validation Error] Failed to query ledger state: {e}")
-        return
+        return []
 
     # Parse API listings for fast lookup
     api_listings = {}
@@ -457,8 +589,7 @@ def validate_and_cleanup_offers(api_data):
                 
             # Check price/amount
             dest = listing.get("destination")
-            is_brokered = dest in BROKERS
-            broker_fee_mult = BROKERS[dest] if is_brokered else 1.0
+            broker_fee_mult = BROKERS.get(dest, 1.0) if isinstance(dest, str) else 1.0
             expected_bid = int(listing["price_drops"] * broker_fee_mult)
             
             # If listing price has changed and no longer matches our bid
@@ -479,14 +610,17 @@ def validate_and_cleanup_offers(api_data):
 
     # Cancel all flagged offers
     if offers_to_cancel:
+        seq, ticket = await get_tx_sequence_and_ticket(client_obj)
         tx = NFTokenCancelOffer(
             account=wallet.classic_address,
             nftoken_offers=offers_to_cancel,
+            sequence=seq,
+            ticket_sequence=ticket,
             fee=calculate_tx_fee()
         )
         if not DRY_RUN:
             try:
-                response = submit_and_wait(tx, client, wallet)
+                response = await submit_and_wait(tx, client_obj, wallet)
                 if response.is_successful() and response.result.get("meta", {}).get("TransactionResult") == "tesSUCCESS":
                     print(f"[Success] Successfully cancelled {len(offers_to_cancel)} invalid/duplicate offers on-ledger.")
                 else:
@@ -495,12 +629,11 @@ def validate_and_cleanup_offers(api_data):
             except Exception as e:
                 print(f"[Error] Failed to submit cancel transaction: {e}")
         else:
-            print(f"[DRY RUN] Would submit NFTokenCancelOffer to cancel: {offers_to_cancel}")
+            print(f"[DRY RUN] Would submit NFTokenCancelOffer (Ticket: {ticket}) to cancel: {offers_to_cancel}")
             
     return objects
 
-
-def get_purchase_price_from_ledger(nft_id):
+async def get_purchase_price_from_ledger(client_obj, http_client, nft_id):
     """
     Query Clio's nft_history command for the specific NFT to find the exact drops we paid.
     Raises ValueError if the transaction cannot be found on-ledger.
@@ -515,7 +648,7 @@ def get_purchase_price_from_ledger(nft_id):
                 }
             ]
         }
-        res = requests.post(XRPL_NODE, json=payload, timeout=15)
+        res = await http_client.post(client_obj.url, json=payload, timeout=15)
         res.raise_for_status()
         data = res.json()
         
@@ -555,10 +688,145 @@ def get_purchase_price_from_ledger(nft_id):
     
     raise ValueError(f"No successful Buy Offer or Direct Accept transaction found in nft_history for NFT {nft_id}.")
 
-def scan_and_sweep(api_data=None):
-    # 1. Fetch offers from XRP Ledger Services NFT API if not provided
+async def process_single_nft_inventory(client_obj, http_client, nft, our_sell_offers, local_free_bal):
+    """
+    Process listings and pricing checks for a single owned NFT.
+    """
+    nft_id = nft.get("NFTokenID")
+    if nft_id in HOLD_IDS:
+        return local_free_bal
+
+    our_active_offer = our_sell_offers.get(nft_id)
+    cost_drops = PURCHASE_PRICE_CACHE.get(nft_id)
+    
+    if cost_drops is None:
+        try:
+            cost_drops = await get_purchase_price_from_ledger(client_obj, http_client, nft_id)
+            PURCHASE_PRICE_CACHE[nft_id] = cost_drops
+        except Exception as e:
+            if our_active_offer:
+                amount_val = our_active_offer.get("amount")
+                current_price = int(amount_val) / 1_000_000 if isinstance(amount_val, str) else 0.0
+                print(f"[Inventory] NFT {nft_id} is already listed at {current_price} XRP. Purchase transaction not found; keeping active listing.")
+                return local_free_bal
+            else:
+                print(f"[CRITICAL ERROR] Failed to determine cost for unlisted NFT {nft_id}: {e}")
+                print(f"                 Skipping listing to prevent listing at a loss.")
+                return local_free_bal
+                    
+    target_relist_price = max(TARGET_SELL_FLOOR_DROPS, int(cost_drops / RELIST_MARKUP_DIVISOR))
+    tx_fee = int(calculate_tx_fee())
+            
+    if our_active_offer:
+        amount_val = our_active_offer.get("amount")
+        current_price_drops = int(amount_val) if isinstance(amount_val, str) else 0
+        offer_id = our_active_offer.get("nft_offer_index")
+        
+        # Verify if listing price is correct
+        if current_price_drops != target_relist_price:
+            # Pre-flight reserve check before relisting (need 0.2 XRP reserve + fee)
+            if local_free_bal < (200_000 + tx_fee):
+                print(f"[Inventory] Insufficient reserve to relist NFT {nft_id}. Free: {local_free_bal / 1_000_000} XRP. Skipping.")
+                return local_free_bal
+            
+            print(f"[Inventory] NFT {nft_id} is listed at incorrect price: {current_price_drops / 1_000_000} XRP.")
+            print(f"            Target price: {target_relist_price / 1_000_000} XRP. Relisting...")
+            
+            # Cancel old offer and create new one
+            if await cancel_sell_offer(client_obj, offer_id, nft_id):
+                local_free_bal += (200_000 - tx_fee)
+                if await create_sell_offer(client_obj, nft_id, target_relist_price):
+                    local_free_bal -= (200_000 + tx_fee)
+    else:
+        # No active sell offer from us on-ledger. Create one!
+        if local_free_bal < (200_000 + tx_fee):
+            print(f"[Inventory] Insufficient reserve to list NFT {nft_id}. Free: {local_free_bal / 1_000_000} XRP. Skipping.")
+            return local_free_bal
+            
+            print(f"[Inventory] NFT {nft_id} is not currently listed. Creating sell listing...")
+        if await create_sell_offer(client_obj, nft_id, target_relist_price):
+            local_free_bal -= (200_000 + tx_fee)
+            
+    return local_free_bal
+
+async def manage_inventory(client_obj, http_client, active_offers):
+    """
+    Manage owned NFTs: Check if they are listed for sale at the correct price.
+    """
+    if not AUTO_RELIST:
+        return
+    print("[Inventory] Scanning owned NFTs to ensure they are listed at the floor...")
+    global PURCHASE_PRICE_CACHE
+    
+    owned_nfts = []
+    marker = None
+    try:
+        while True:
+            request = AccountNFTs(account=wallet.classic_address, marker=marker)
+            response = await client_obj.request(request)
+            if not response.is_successful():
+                err_code = response.result.get("error")
+                if err_code == "actNotFound":
+                    print(f"[Inventory] Account {wallet.classic_address} is not active/funded on-ledger. Skipping inventory scan.")
+                else:
+                    print(f"[Inventory Error] Failed to fetch account NFTs from ledger: {response.result.get('error_message', err_code)}")
+                return
+            
+            owned_nfts.extend(response.result.get("account_nfts", []))
+            marker = response.result.get("marker")
+            if not marker:
+                break
+    except Exception as e:
+        print(f"[Inventory Error] Failed to fetch account NFTs: {e}")
+        return
+        
+    collection_nfts = [n for n in owned_nfts if n.get("Issuer") == ISSUER and n.get("NFTokenTaxon") == TAXON]
+    print(f"[Inventory] Found {len(collection_nfts)} NFTs from target collection in wallet.")
+    
+    # Map active sell offers on-ledger for fast local lookup
+    our_sell_offers = {}
+    if active_offers:
+        for obj in active_offers:
+            flags = obj.get("Flags", 0)
+            is_sell = (flags & 1) == 1
+            if is_sell:
+                nft_id = obj.get("NFTokenID")
+                our_sell_offers[nft_id] = {
+                    "nft_offer_index": obj.get("index"),
+                    "amount": obj.get("Amount"),
+                    "flags": flags,
+                    "owner": wallet.classic_address
+                }
+    
+    local_free_bal = await get_free_balance(client_obj)
+    
+    # Pre-fetch missing purchase history concurrently to optimize API roundtrips
+    nfts_to_fetch = [n for n in collection_nfts if n.get("NFTokenID") not in HOLD_IDS and PURCHASE_PRICE_CACHE.get(n.get("NFTokenID")) is None]
+    if nfts_to_fetch:
+        print(f"[Inventory] Querying Clio history for {len(nfts_to_fetch)} NFTs (max concurrency: 3)...")
+        sem = asyncio.Semaphore(3)
+        async def fetch_single_price(nft_item):
+            n_id = nft_item.get("NFTokenID")
+            print(f"[Inventory Debug] fetch_single_price entered for {n_id}")
+            async with sem:
+                try:
+                    price = await get_purchase_price_from_ledger(client_obj, http_client, n_id)
+                    PURCHASE_PRICE_CACHE[n_id] = price
+                except Exception as e:
+                    print(f"[Inventory Warning] Failed to fetch price for {n_id}: {e}")
+        await asyncio.gather(*(fetch_single_price(n) for n in nfts_to_fetch))
+        save_purchase_price_cache()
+    
+    # Process listing transactions sequentially to prevent Ticket Sequence race conditions
+    for nft in collection_nfts:
+        local_free_bal = await process_single_nft_inventory(client_obj, http_client, nft, our_sell_offers, local_free_bal)
+
+async def scan_and_sweep(client_obj, http_client, api_data=None):
+    """
+    Scan collection for deals and sweep them, processing multiple items concurrently.
+    """
     if not api_data:
-        api_data = fetch_api_sell_offers()
+        api_data = await fetch_api_sell_offers(http_client)
         
     if not api_data or "data" not in api_data or "offers" not in api_data["data"]:
         print("[API Warning] No valid offer data received from API. Skipping sweep.")
@@ -567,11 +835,11 @@ def scan_and_sweep(api_data=None):
     offers_list = api_data["data"]["offers"]
     print(f"[Scan] Scanned {len(offers_list)} NFTs in the collection.")
     
-    # 2. Query open Buy Offers on-ledger ONCE at start of cycle
+    # Query open Buy Offers on-ledger ONCE at start of cycle
     active_bids_nft_ids = set()
     try:
-        req_objs = AccountObjects(account=wallet.classic_address, type="nft_offer")
-        res_objs = client.request(req_objs)
+        req_objs = AccountObjects(account=wallet.classic_address, type=AccountObjectType.NFT_OFFER)
+        res_objs = await client_obj.request(req_objs)
         if res_objs.is_successful():
             for obj in res_objs.result.get("account_objects", []):
                 # Buy offers do not have TF_SELL_NFTOKEN flag (1)
@@ -580,12 +848,7 @@ def scan_and_sweep(api_data=None):
     except Exception as e:
         print(f"[Warning] Failed to check active bids on-ledger: {e}")
 
-    # Enforce strict safety limit of maximum active Buy Offers on-ledger
-    if len(active_bids_nft_ids) >= MAX_ACTIVE_BUYS:
-        print(f"[Safety] Already have {len(active_bids_nft_ids)} active Buy Offers on-ledger. Skipping sweep to stay within limit of {MAX_ACTIVE_BUYS}.")
-        return
-
-    # 3. Collect all valid candidates below target floor
+    # Collect all valid candidates below target floor
     candidates = []
     for nft_entry in offers_list:
         nftoken_id = nft_entry.get("NFTokenID")
@@ -637,14 +900,20 @@ def scan_and_sweep(api_data=None):
                     "broker_fee_mult": broker_fee_mult
                 })
                 
-    # 4. Sort candidates by priority list (first) and then total expected drops ascending
+    # Sort candidates by priority list (first) and then total expected drops ascending
     candidates.sort(key=lambda x: (x["nftoken_id"] not in PRIORITY_BUY_IDS, x["total_expected_drops"]))
     
-    # 5. Get current free balance on-ledger once and track locally
-    local_free_bal = get_free_balance()
+    # Get current free balance on-ledger
+    local_free_bal = await get_free_balance(client_obj)
     
-    # 6. Process candidates in order of price
+    tasks = []
+    # Process candidates in order of price, scheduling parallel sweeps up to limits
     for item in candidates:
+        total_active_buys = len(active_bids_nft_ids) + len(tasks)
+        if total_active_buys >= MAX_ACTIVE_BUYS:
+            print(f"[Safety] Already have {total_active_buys} active Buy Offers/pending tasks. Skipping further sweeps in this cycle.")
+            break
+            
         nftoken_id = item["nftoken_id"]
         owner = item["owner"]
         price_drops = item["price_drops"]
@@ -652,200 +921,100 @@ def scan_and_sweep(api_data=None):
         offer_id = item["offer_id"]
         destination = item["destination"]
         
-        print(f"[Match] Found listing below floor! NFT: {nftoken_id}")
-        print(f"        Price: {price_drops / 1_000_000} XRP | Total Cost (with fees): {total_expected_drops / 1_000_000} XRP | Owner: {owner}")
-        
-        # Check if we already have an active bid (using fast local lookup)
-        if nftoken_id in active_bids_nft_ids:
-            print(f"        Active buy offer already exists on-ledger. Skipping duplicate bid.")
+        # Check if we already have an active bid (or planned task)
+        if nftoken_id in active_bids_nft_ids or any(t[0] == nftoken_id for t in tasks):
             continue
         
-        # Pre-flight reserve and balance check using local free balance tracking
+        # Pre-flight reserve and balance check
         is_brokered = destination in BROKERS
         tx_fee = int(calculate_tx_fee())
         required_drops = (total_expected_drops + 200_000 + tx_fee) if is_brokered else (total_expected_drops + tx_fee)
         
         if local_free_bal < required_drops:
-            print(f"        Insufficient local free balance/reserve to buy. Free: {local_free_bal / 1_000_000} XRP, Required: {required_drops / 1_000_000} XRP. Skipping.")
+            print(f"[Match] Found listing below floor! NFT: {nftoken_id}")
+            print(f"        Price: {price_drops / 1_000_000} XRP | Total Cost (with fees): {total_expected_drops / 1_000_000} XRP | Owner: {owner}")
+            print(f"        Insufficient balance to buy. Free: {local_free_bal / 1_000_000} XRP, Required: {required_drops / 1_000_000} XRP. Skipping.")
             continue
         
-        success = False
-        paid_drops = 0
+        # Deduct from local balance tracking for current cycle
+        local_free_bal -= required_drops
         
-        # Handle Direct vs. Brokered Buy
-        if not is_brokered:
-            success, paid_drops = execute_direct_buy(offer_id, nftoken_id, price_drops)
-        else:
-            success, paid_drops = execute_brokered_buy(owner, nftoken_id, price_drops, item["broker_fee_mult"])
-        
-        if success:
-            # Deduct from local free balance to account for committed funds/reserves
-            local_free_bal -= required_drops
+        async def run_buy_task(nft_id, own_addr, off_id, pr_drops, dest_addr, broker_mult):
+            print(f"[Match] Found listing below floor! NFT: {nft_id}")
+            print(f"        Price: {pr_drops / 1_000_000} XRP | Owner: {own_addr}")
             
-            relist_price_drops = max(TARGET_SELL_FLOOR_DROPS, int(paid_drops / RELIST_MARKUP_DIVISOR))
-            # Proactively list it if direct buy succeeded and auto-relist is enabled (and not on hold list)
-            if AUTO_RELIST and nftoken_id not in HOLD_IDS and not destination:
-                create_sell_offer(nftoken_id, relist_price_drops)
+            success = False
+            paid_drops = 0
+            is_brok = dest_addr in BROKERS
             
-            # Stop sweeping further in this cycle to ensure we buy one at a time
-            print("[Safety] Stopping cycle sweep after successful purchase/bid to prioritize cheapest next cycle.")
-            break
-
-def manage_inventory(active_offers):
-    """
-    Manage owned NFTs: Check if they are listed for sale at the correct price.
-    """
-    if not AUTO_RELIST:
-        return
-    print("[Inventory] Scanning owned NFTs to ensure they are listed at the floor...")
-    global PURCHASE_PRICE_CACHE
-    
-    owned_nfts = []
-    marker = None
-    try:
-        while True:
-            request = AccountNFTs(
-                account=wallet.classic_address,
-                marker=marker
-            )
-            response = client.request(request)
-            if not response.is_successful():
-                err_code = response.result.get("error")
-                if err_code == "actNotFound":
-                    print(f"[Inventory] Account {wallet.classic_address} is not active/funded on-ledger. Skipping inventory scan.")
-                else:
-                    print(f"[Inventory Error] Failed to fetch account NFTs from ledger: {response.result.get('error_message', err_code)}")
-                return
-            
-            owned_nfts.extend(response.result.get("account_nfts", []))
-            marker = response.result.get("marker")
-            if not marker:
-                break
-    except Exception as e:
-        print(f"[Inventory Error] Failed to fetch account NFTs: {e}")
-        return
-        
-    collection_nfts = []
-    for nft in owned_nfts:
-        if nft.get("Issuer") == ISSUER and nft.get("NFTokenTaxon") == TAXON:
-            collection_nfts.append(nft)
-            
-    print(f"[Inventory] Found {len(collection_nfts)} NFTs from target collection in wallet.")
-    
-    # Map active sell offers on-ledger for fast local lookup (avoiding sequential sell offer network calls)
-    our_sell_offers = {}
-    if active_offers:
-        for obj in active_offers:
-            flags = obj.get("Flags", 0)
-            is_sell = (flags & 1) == 1
-            if is_sell:
-                nft_id = obj.get("NFTokenID")
-                our_sell_offers[nft_id] = {
-                    "nft_offer_index": obj.get("index"),
-                    "amount": obj.get("Amount"),
-                    "flags": flags,
-                    "owner": wallet.classic_address
-                }
-    
-    # Get current free balance on-ledger once and track locally to avoid reserve errors
-    local_free_bal = get_free_balance()
-    
-    for nft in collection_nfts:
-        nft_id = nft.get("NFTokenID")
-        
-        # Skip hold list NFTs (never auto-sell or manage listings for them)
-        if nft_id in HOLD_IDS:
-            continue
-        
-        
-        # Get active sell offer from local lookup map
-        our_active_offer = our_sell_offers.get(nft_id)
-        
-        # Get purchase price from cache or query dynamically from history if not cached
-        cost_drops = PURCHASE_PRICE_CACHE.get(nft_id)
-        if cost_drops is None:
-            try:
-                cost_drops = get_purchase_price_from_ledger(nft_id)
-                PURCHASE_PRICE_CACHE[nft_id] = cost_drops
-            except Exception as e:
-                if our_active_offer:
-                    amount_val = our_active_offer.get("amount")
-                    current_price = int(amount_val) / 1_000_000 if isinstance(amount_val, str) else 0.0
-                    print(f"[Inventory] NFT {nft_id} is already listed at {current_price} XRP. Purchase transaction not found in recent history; keeping active listing.")
-                    continue
-                else:
-                    print(f"[CRITICAL ERROR] Failed to determine cost for unlisted NFT {nft_id}: {e}")
-                    print(f"                 Skipping listing to prevent listing at a loss.")
-                    continue
-                    
-        target_relist_price = max(TARGET_SELL_FLOOR_DROPS, int(cost_drops / RELIST_MARKUP_DIVISOR))
-                
-        if our_active_offer:
-            amount_val = our_active_offer.get("amount")
-            if isinstance(amount_val, str):
-                current_price_drops = int(amount_val)
+            if not is_brok:
+                success, paid_drops = await execute_direct_buy(client_obj, off_id, nft_id, pr_drops)
             else:
-                current_price_drops = 0
-            offer_id = our_active_offer.get("nft_offer_index")
+                success, paid_drops = await execute_brokered_buy(client_obj, own_addr, nft_id, pr_drops, broker_mult)
             
-            # Verify if listing price is correct
-            if current_price_drops != target_relist_price:
-                # Pre-flight reserve check before relisting (need 0.2 XRP reserve + dynamic fee)
-                # Note: Cancel will release 0.2 XRP, but the transaction still requires sufficient funds at execution.
-                tx_fee = int(calculate_tx_fee())
-                if local_free_bal < (200_000 + tx_fee):
-                    print(f"[Inventory] Insufficient reserve to relist NFT {nft_id}. Free: {local_free_bal / 1_000_000} XRP, Required: {(200_000 + tx_fee) / 1_000_000} XRP. Skipping.")
-                    continue
-                
-                print(f"[Inventory] NFT {nft_id} is listed at incorrect price: {current_price_drops / 1_000_000} XRP.")
-                print(f"            Target price: {target_relist_price / 1_000_000} XRP. Relisting...")
-                
-                # Cancel old offer and create new one
-                if cancel_sell_offer(offer_id, nft_id):
-                    # Canceling frees up 200,000 drops reserve (minus cancel fee)
-                    local_free_bal += (200_000 - tx_fee)
-                    if create_sell_offer(nft_id, target_relist_price):
-                        local_free_bal -= (200_000 + tx_fee)
-        else:
-            # No active sell offer from us on-ledger. Create one!
-            # Requires 200,000 drops (0.2 XRP reserve) + dynamic fee
-            tx_fee = int(calculate_tx_fee())
-            if local_free_bal < (200_000 + tx_fee):
-                print(f"[Inventory] Insufficient reserve to list NFT {nft_id}. Free: {local_free_bal / 1_000_000} XRP, Required: {(200_000 + tx_fee) / 1_000_000} XRP. Skipping.")
-                continue
-                
-            print(f"[Inventory] NFT {nft_id} is not currently listed. Creating sell listing...")
-            if create_sell_offer(nft_id, target_relist_price):
-                local_free_bal -= (200_000 + tx_fee)
+            if success:
+                relist_price_drops = max(TARGET_SELL_FLOOR_DROPS, int(paid_drops / RELIST_MARKUP_DIVISOR))
+                if AUTO_RELIST and nft_id not in HOLD_IDS and not dest_addr:
+                    await create_sell_offer(client_obj, nft_id, relist_price_drops)
 
-def main():
-    while True:
-        try:
-            print("\n" + "-" * 50)
-            print(f"Starting Bot Cycle at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            print("-" * 50)
-            
-            # Step 1: Fetch API offers once for the cycle
-            api_data = fetch_api_sell_offers()
-            
-            # Step 2: Validate all open buy and sell offers, canceling obsolete/invalid/duplicate ones
-            active_offers = validate_and_cleanup_offers(api_data)
-            
-            # Step 3: Manage inventory and relist at correct floor
-            manage_inventory(active_offers)
-            
-            # Step 4: Scan collection for deals and buy them
-            scan_and_sweep(api_data)
-            
-            print(f"\nCycle complete. Waiting {POLL_INTERVAL} seconds...")
-        except KeyboardInterrupt:
-            print("\nShutting down bot.")
-            sys.exit(0)
-        except Exception as e:
-            print(f"[Main Error] Unexpected error in main loop: {e}")
-            print("Retrying next cycle...")
-            
-        time.sleep(POLL_INTERVAL)
+        tasks.append((nftoken_id, run_buy_task(nftoken_id, owner, offer_id, price_drops, destination, item["broker_fee_mult"])))
+
+    if tasks:
+        print(f"[Sweep] Executing {len(tasks)} sweeps concurrently in this cycle using Ticket sequences...")
+        await asyncio.gather(*(t[1] for t in tasks))
+
+async def async_main():
+    """
+    Main asynchronous loop of the bot.
+    """
+    # Establish XRPL client
+    try:
+        client_obj = AsyncJsonRpcClient(XRPL_NODE)
+        print("Connected to XRPL Node.")
+    except Exception as e:
+        print(f"[CRITICAL ERROR] Failed to connect to XRPL node {XRPL_NODE}: {e}")
+        sys.exit(1)
+
+    async with httpx.AsyncClient() as http_client:
+        while True:
+            try:
+                print("\n" + "-" * 50)
+                print(f"Starting Bot Cycle at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print("-" * 50)
+                
+                # Step 0: Update cached transaction fee for this cycle
+                await update_current_fee(client_obj)
+                
+                # Step 1: Ensure ticket pool is loaded/topped up on-ledger
+                await ensure_ticket_pool(client_obj)
+                
+                # Step 2: Fetch API offers once for the cycle
+                api_data = await fetch_api_sell_offers(http_client)
+                
+                # Step 3: Validate all open buy and sell offers, canceling obsolete ones
+                active_offers = await validate_and_cleanup_offers(client_obj, api_data)
+                
+                # Step 4: Manage inventory and relist at correct floor
+                await manage_inventory(client_obj, http_client, active_offers)
+                
+                # Step 5: Scan collection for deals and buy them
+                await scan_and_sweep(client_obj, http_client, api_data)
+                
+                print(f"\nCycle complete. Waiting {POLL_INTERVAL} seconds...")
+            except KeyboardInterrupt:
+                print("\nShutting down bot.")
+                sys.exit(0)
+            except Exception as e:
+                print(f"[Main Error] Unexpected error in main loop: {e}")
+                import traceback
+                traceback.print_exc()
+                print("Retrying next cycle...")
+                
+            await asyncio.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(async_main())
+    except KeyboardInterrupt:
+        print("\nShutting down bot.")
+        sys.exit(0)

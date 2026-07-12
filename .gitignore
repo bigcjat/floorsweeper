@@ -10,3 +10,5 @@ dropchan_ranks.js
 rarities.json
 rarities.js
 rarity.html
+update_hold_ids.py
+purchase_price_cache.json
