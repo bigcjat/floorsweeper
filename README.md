@@ -57,7 +57,7 @@ Copy the generated `Secret Seed` and paste it as `XRPL_SEED` in your `.env`. Mak
 
 ### Core Configuration
 * `XRPL_SEED`: The secret seed of your wallet (starts with `s`). **Keep this secure and never commit it to Git.**
-* `XRPL_NODE`: The public JSON-RPC node endpoint (e.g., `https://s1.ripple.com:51234/` or `https://xrplcluster.com`).
+* `XRPL_NODE`: The public JSON-RPC Clio node endpoint (e.g., `https://s1.ripple.com:51234/`). Note: Clio nodes are required to support historical transaction queries like `nft_history`.
 * `DRY_RUN`: Set to `True` to simulate sweeps and listings without submitting live ledger transactions. Set to `False` for live trading.
 * `POLL_INTERVAL`: The delay in seconds between each loop cycle (default is `20`).
 
@@ -71,7 +71,7 @@ Copy the generated `Secret Seed` and paste it as `XRPL_SEED` in your `.env`. Mak
 * `xrpldata.com API Key`: (Optional) Your API key for `api.xrpldata.com` to bypass rate limits when fetching market offers.
 
 ### Advanced Parameters
-* `BROKER_FEE_MULTIPLIER`: The fee multiplier to cover marketplace matches (default is `1.01589` to cover XRP Cafe's `1.589%` broker fee).
+* `BROKERS_CONFIG`: A JSON-formatted mapping string of supported broker addresses to their fee multipliers (e.g., `'{"rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC": 1.01589}'` to cover XRP Cafe's `1.589%` broker fee). Bypasses and ignores private offers pointing to other destination addresses.
 * `MAX_ACTIVE_BUYS`: The maximum number of active buy bids the bot is allowed to keep open on-ledger simultaneously (default is `4`).
 * `BUY_OFFER_EXPIRATION_SEC`: The duration in seconds before open buy offers automatically expire on-ledger (default is `600` / 10 minutes).
 * `RELIST_MARKUP_DIVISOR`: The margin divisor to protect listings from selling at a loss (default is `0.9` for a ~11% profit margin check).

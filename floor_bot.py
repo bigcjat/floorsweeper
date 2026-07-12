@@ -35,8 +35,17 @@ XRP_API_KEY = os.getenv("XRP_API_KEY", "").strip()
 ISSUER = os.getenv("TARGET_ISSUER", "rDropCHANEgmG7FBz1nzPpG27BGzWjnCnn").strip()
 TAXON = int(os.getenv("TARGET_TAXON", "0"))
 
-# Broker Fee Multiplier
-BROKER_FEE_MULTIPLIER = float(os.getenv("BROKER_FEE_MULTIPLIER", "1.01589"))
+# Brokers configuration: mapping of broker address -> fee multiplier
+default_brokers = {"rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC": 1.01589}
+brokers_env = os.getenv("BROKERS_CONFIG", "").strip()
+if brokers_env:
+    try:
+        BROKERS = json.loads(brokers_env)
+    except Exception as parse_err:
+        print(f"[Warning] Failed to parse BROKERS_CONFIG: {parse_err}. Using default XRP Cafe broker.")
+        BROKERS = default_brokers
+else:
+    BROKERS = default_brokers
 
 # Safety limits & user preferences
 MAX_ACTIVE_BUYS = int(os.getenv("MAX_ACTIVE_BUYS", "4"))
@@ -49,6 +58,9 @@ MAX_FEE_DROPS = int(os.getenv("MAX_FEE_DROPS", "1200"))
 TARGET_BUY_FLOOR_DROPS = int(TARGET_BUY_FLOOR_XRP * 1_000_000)
 TARGET_SELL_FLOOR_DROPS = int(TARGET_SELL_FLOOR_XRP * 1_000_000)
 
+# In-memory cache to prevent redundant on-ledger history scans
+PURCHASE_PRICE_CACHE = {}
+
 print("=" * 80)
 print("              XRPL NFT FLOOR SWEEPER & RELISTING BOT")
 print("=" * 80)
@@ -57,7 +69,7 @@ print(f"Target Issuer: {ISSUER}")
 print(f"Target Taxon:  {TAXON}")
 print(f"Max Buy Cap:   {TARGET_BUY_FLOOR_XRP} XRP ({TARGET_BUY_FLOOR_DROPS} drops)")
 print(f"Min Sell Floor:{TARGET_SELL_FLOOR_XRP} XRP ({TARGET_SELL_FLOOR_DROPS} drops)")
-print(f"Broker Fee Mult:{BROKER_FEE_MULTIPLIER}")
+print(f"Brokers:       {json.dumps(BROKERS)}")
 print(f"Max Active Buys:{MAX_ACTIVE_BUYS}")
 print(f"Buy Expiration:{BUY_OFFER_EXPIRATION_SEC} seconds")
 print(f"Relist Divisor:{RELIST_MARKUP_DIVISOR}")
@@ -192,12 +204,12 @@ def execute_direct_buy(offer_id, nftoken_id, price_drops):
         print(f"[Error] Transaction submission failed: {e}")
         return False, 0
 
-def execute_brokered_buy(owner_address, nftoken_id, price_drops):
+def execute_brokered_buy(owner_address, nftoken_id, price_drops, broker_fee_mult):
     """
     Create a Buy Offer for a marketplace listing to trigger the broker match.
     """
     # We bid the listing price + the broker fee required by the marketplace broker
-    bid_amount = int(price_drops * BROKER_FEE_MULTIPLIER)
+    bid_amount = int(price_drops * broker_fee_mult)
     
     # Hard Safety Limit: Never place a buy bid for more than the target buy floor under any circumstances
     if bid_amount > TARGET_BUY_FLOOR_DROPS:
@@ -248,7 +260,7 @@ def create_sell_offer(nftoken_id, price_drops):
         account=wallet.classic_address,
         nftoken_id=nftoken_id,
         amount=str(price_drops),
-        flags=[NFTokenCreateOfferFlag.TF_SELL_NFTOKEN],
+        flags=NFTokenCreateOfferFlag.TF_SELL_NFTOKEN,
         fee=calculate_tx_fee()
     )
     
@@ -423,11 +435,14 @@ def validate_and_cleanup_offers(api_data):
                 continue
                 
             # Check price/amount
-            is_brokered = bool(listing["destination"] and listing["destination"] != wallet.classic_address)
-            expected_bid = int(listing["price_drops"] * BROKER_FEE_MULTIPLIER) if is_brokered else listing["price_drops"]
+            dest = listing.get("destination")
+            is_brokered = dest in BROKERS
+            broker_fee_mult = BROKERS[dest] if is_brokered else 1.0
+            expected_bid = int(listing["price_drops"] * broker_fee_mult)
             
             # If listing price has changed and no longer matches our bid
-            current_bid = int(obj.get("Amount", 0))
+            amount_val = obj.get("Amount")
+            current_bid = int(amount_val) if isinstance(amount_val, str) else 0
             if abs(current_bid - expected_bid) > 5:
                 print(f"[Validation] Buy offer for NFT {nft_id} has outdated bid ({current_bid / 1_000_000} XRP vs expected {expected_bid / 1_000_000} XRP). Scheduling cancel.")
                 offers_to_cancel.append(offer_index)
@@ -436,7 +451,7 @@ def validate_and_cleanup_offers(api_data):
     for nft_id, sell_list in nft_to_sell_offers.items():
         if len(sell_list) > 1:
             # Sort by price ascending, then index (keep the lowest/best offer, cancel others)
-            sell_list.sort(key=lambda x: int(x.get("Amount", 0)))
+            sell_list.sort(key=lambda x: int(x.get("Amount")) if isinstance(x.get("Amount"), str) else float('inf'))
             for dup in sell_list[1:]:
                 print(f"[Validation] Found duplicate sell offer for NFT {nft_id}. Scheduling cancel.")
                 offers_to_cancel.append(dup.get("index"))
@@ -460,6 +475,8 @@ def validate_and_cleanup_offers(api_data):
                 print(f"[Error] Failed to submit cancel transaction: {e}")
         else:
             print(f"[DRY RUN] Would submit NFTokenCancelOffer to cancel: {offers_to_cancel}")
+            
+    return objects
 
 
 def get_purchase_price_from_ledger(nft_id):
@@ -568,9 +585,24 @@ def scan_and_sweep(api_data=None):
             if price_drops <= 0:
                 continue
                 
+            # Check destination to filter out private sales/transfers
+            dest = offer.get("Destination")
+            if dest:
+                if dest == wallet.classic_address:
+                    is_brokered = False
+                    broker_fee_mult = 1.0
+                elif dest in BROKERS:
+                    is_brokered = True
+                    broker_fee_mult = BROKERS[dest]
+                else:
+                    # Destination is set to an unsupported address (private sale) -> Skip it
+                    continue
+            else:
+                is_brokered = False
+                broker_fee_mult = 1.0
+
             # Calculate total expected cost (including broker fee if applicable)
-            is_brokered = bool(offer.get("Destination") and offer.get("Destination") != wallet.classic_address)
-            total_expected_drops = int(price_drops * BROKER_FEE_MULTIPLIER) if is_brokered else price_drops
+            total_expected_drops = int(price_drops * broker_fee_mult)
             
             # Check if total cost is under target buy floor (e.g. 4.5 XRP)
             if total_expected_drops < TARGET_BUY_FLOOR_DROPS:
@@ -580,7 +612,8 @@ def scan_and_sweep(api_data=None):
                     "price_drops": price_drops,
                     "total_expected_drops": total_expected_drops,
                     "offer_id": offer.get("OfferID"),
-                    "destination": offer.get("Destination")
+                    "destination": dest,
+                    "broker_fee_mult": broker_fee_mult
                 })
                 
     # 4. Sort candidates by total expected drops ascending (cheapest first!)
@@ -607,8 +640,9 @@ def scan_and_sweep(api_data=None):
             continue
         
         # Pre-flight reserve and balance check using local free balance tracking
-        is_brokered = bool(destination and destination != wallet.classic_address)
-        required_drops = (total_expected_drops + 200_000) if is_brokered else (total_expected_drops + 10)
+        is_brokered = destination in BROKERS
+        tx_fee = int(calculate_tx_fee())
+        required_drops = (total_expected_drops + 200_000 + tx_fee) if is_brokered else (total_expected_drops + tx_fee)
         
         if local_free_bal < required_drops:
             print(f"        Insufficient local free balance/reserve to buy. Free: {local_free_bal / 1_000_000} XRP, Required: {required_drops / 1_000_000} XRP. Skipping.")
@@ -621,7 +655,7 @@ def scan_and_sweep(api_data=None):
         if not is_brokered:
             success, paid_drops = execute_direct_buy(offer_id, nftoken_id, price_drops)
         else:
-            success, paid_drops = execute_brokered_buy(owner, nftoken_id, price_drops)
+            success, paid_drops = execute_brokered_buy(owner, nftoken_id, price_drops, item["broker_fee_mult"])
         
         if success:
             # Deduct from local free balance to account for committed funds/reserves
@@ -636,11 +670,12 @@ def scan_and_sweep(api_data=None):
             print("[Safety] Stopping cycle sweep after successful purchase/bid to prioritize cheapest next cycle.")
             break
 
-def manage_inventory():
+def manage_inventory(active_offers):
     """
     Manage owned NFTs: Check if they are listed for sale at the correct price.
     """
     print("[Inventory] Scanning owned NFTs to ensure they are listed at the floor...")
+    global PURCHASE_PRICE_CACHE
     
     owned_nfts = []
     marker = None
@@ -674,35 +709,48 @@ def manage_inventory():
             
     print(f"[Inventory] Found {len(collection_nfts)} NFTs from target collection in wallet.")
     
+    # Map active sell offers on-ledger for fast local lookup (avoiding sequential sell offer network calls)
+    our_sell_offers = {}
+    if active_offers:
+        for obj in active_offers:
+            flags = obj.get("Flags", 0)
+            is_sell = (flags & 1) == 1
+            if is_sell:
+                nft_id = obj.get("NFTokenID")
+                our_sell_offers[nft_id] = {
+                    "nft_offer_index": obj.get("index"),
+                    "amount": obj.get("Amount"),
+                    "flags": flags,
+                    "owner": wallet.classic_address
+                }
+    
     # Get current free balance on-ledger once and track locally to avoid reserve errors
     local_free_bal = get_free_balance()
     
     for nft in collection_nfts:
         nft_id = nft.get("NFTokenID")
         
-        # Get active sell offers on this NFT on-ledger first
-        sell_offers = check_owned_nfts_sell_offers(nft_id)
+        # Get active sell offer from local lookup map
+        our_active_offer = our_sell_offers.get(nft_id)
         
-        our_active_offer = None
-        for offer in sell_offers:
-            if offer.get("owner") == wallet.classic_address:
-                our_active_offer = offer
-                break
-        
-        # Get purchase price from ledger transaction history dynamically
-        try:
-            cost_drops = get_purchase_price_from_ledger(nft_id)
-            target_relist_price = max(TARGET_SELL_FLOOR_DROPS, int(cost_drops / RELIST_MARKUP_DIVISOR))
-        except Exception as e:
-            if our_active_offer:
-                amount_val = our_active_offer.get("amount")
-                current_price = int(amount_val) / 1_000_000 if isinstance(amount_val, str) else 0.0
-                print(f"[Inventory] NFT {nft_id} is already listed at {current_price} XRP. Purchase transaction not found in recent history; keeping active listing.")
-                continue
-            else:
-                print(f"[CRITICAL ERROR] Failed to determine cost for unlisted NFT {nft_id}: {e}")
-                print(f"                 Skipping listing to prevent listing at a loss.")
-                continue
+        # Get purchase price from cache or query dynamically from history if not cached
+        cost_drops = PURCHASE_PRICE_CACHE.get(nft_id)
+        if cost_drops is None:
+            try:
+                cost_drops = get_purchase_price_from_ledger(nft_id)
+                PURCHASE_PRICE_CACHE[nft_id] = cost_drops
+            except Exception as e:
+                if our_active_offer:
+                    amount_val = our_active_offer.get("amount")
+                    current_price = int(amount_val) / 1_000_000 if isinstance(amount_val, str) else 0.0
+                    print(f"[Inventory] NFT {nft_id} is already listed at {current_price} XRP. Purchase transaction not found in recent history; keeping active listing.")
+                    continue
+                else:
+                    print(f"[CRITICAL ERROR] Failed to determine cost for unlisted NFT {nft_id}: {e}")
+                    print(f"                 Skipping listing to prevent listing at a loss.")
+                    continue
+                    
+        target_relist_price = max(TARGET_SELL_FLOOR_DROPS, int(cost_drops / RELIST_MARKUP_DIVISOR))
                 
         if our_active_offer:
             amount_val = our_active_offer.get("amount")
@@ -714,10 +762,11 @@ def manage_inventory():
             
             # Verify if listing price is correct
             if current_price_drops != target_relist_price:
-                # Pre-flight reserve check before relisting (need 0.2 XRP reserve + 10 drops fee)
+                # Pre-flight reserve check before relisting (need 0.2 XRP reserve + dynamic fee)
                 # Note: Cancel will release 0.2 XRP, but the transaction still requires sufficient funds at execution.
-                if local_free_bal < 200_010:
-                    print(f"[Inventory] Insufficient reserve to relist NFT {nft_id}. Free: {local_free_bal / 1_000_000} XRP, Required: 0.20001 XRP. Skipping.")
+                tx_fee = int(calculate_tx_fee())
+                if local_free_bal < (200_000 + tx_fee):
+                    print(f"[Inventory] Insufficient reserve to relist NFT {nft_id}. Free: {local_free_bal / 1_000_000} XRP, Required: {(200_000 + tx_fee) / 1_000_000} XRP. Skipping.")
                     continue
                 
                 print(f"[Inventory] NFT {nft_id} is listed at incorrect price: {current_price_drops / 1_000_000} XRP.")
@@ -725,20 +774,21 @@ def manage_inventory():
                 
                 # Cancel old offer and create new one
                 if cancel_sell_offer(offer_id, nft_id):
-                    # Canceling frees up 200,000 drops reserve (minus 10 drops fee)
-                    local_free_bal += 199_990
+                    # Canceling frees up 200,000 drops reserve (minus cancel fee)
+                    local_free_bal += (200_000 - tx_fee)
                     if create_sell_offer(nft_id, target_relist_price):
-                        local_free_bal -= 200_010
+                        local_free_bal -= (200_000 + tx_fee)
         else:
             # No active sell offer from us on-ledger. Create one!
-            # Requires 200,010 drops (0.2 XRP reserve + 10 drops fee)
-            if local_free_bal < 200_010:
-                print(f"[Inventory] Insufficient reserve to list NFT {nft_id}. Free: {local_free_bal / 1_000_000} XRP, Required: 0.20001 XRP. Skipping.")
+            # Requires 200,000 drops (0.2 XRP reserve) + dynamic fee
+            tx_fee = int(calculate_tx_fee())
+            if local_free_bal < (200_000 + tx_fee):
+                print(f"[Inventory] Insufficient reserve to list NFT {nft_id}. Free: {local_free_bal / 1_000_000} XRP, Required: {(200_000 + tx_fee) / 1_000_000} XRP. Skipping.")
                 continue
                 
             print(f"[Inventory] NFT {nft_id} is not currently listed. Creating sell listing...")
             if create_sell_offer(nft_id, target_relist_price):
-                local_free_bal -= 200_010
+                local_free_bal -= (200_000 + tx_fee)
 
 def main():
     while True:
@@ -751,10 +801,10 @@ def main():
             api_data = fetch_api_sell_offers()
             
             # Step 2: Validate all open buy and sell offers, canceling obsolete/invalid/duplicate ones
-            validate_and_cleanup_offers(api_data)
+            active_offers = validate_and_cleanup_offers(api_data)
             
             # Step 3: Manage inventory and relist at correct floor
-            manage_inventory()
+            manage_inventory(active_offers)
             
             # Step 4: Scan collection for deals and buy them
             scan_and_sweep(api_data)
