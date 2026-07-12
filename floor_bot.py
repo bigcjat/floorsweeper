@@ -421,10 +421,6 @@ def validate_and_cleanup_offers(api_data):
         nft_id = obj.get("NFTokenID")
         offer_index = obj.get("index")
         
-        # Skip validation and cleanup for hold list NFTs (keep buy and sell offers intact)
-        if nft_id in HOLD_IDS:
-            continue
-        
         # Check expiration first
         expiration = obj.get("Expiration")
         if expiration is not None and ripple_time > expiration:
@@ -433,6 +429,9 @@ def validate_and_cleanup_offers(api_data):
             continue
 
         if is_sell:
+            # Skip managing active sell offers for hold list NFTs
+            if nft_id in HOLD_IDS:
+                continue
             # Sell offer check
             if nft_id not in owned_ids:
                 print(f"[Validation] Found orphan sell offer for NFT {nft_id} (not owned by us). Scheduling cancel.")
@@ -450,6 +449,10 @@ def validate_and_cleanup_offers(api_data):
             if not listing:
                 print(f"[Validation] Found buy offer for NFT {nft_id} but it is no longer listed for sale. Scheduling cancel.")
                 offers_to_cancel.append(offer_index)
+                continue
+                
+            # Skip price check for hold list NFTs to keep our manual/custom bids active
+            if nft_id in HOLD_IDS:
                 continue
                 
             # Check price/amount
