@@ -51,6 +51,7 @@ else:
 MAX_ACTIVE_BUYS = int(os.getenv("MAX_ACTIVE_BUYS", "4"))
 BUY_OFFER_EXPIRATION_SEC = int(os.getenv("BUY_OFFER_EXPIRATION_SEC", "600"))
 RELIST_MARKUP_DIVISOR = float(os.getenv("RELIST_MARKUP_DIVISOR", "0.9"))
+AUTO_RELIST = os.getenv("AUTO_RELIST", "True").lower() == "true"
 BASE_FEE_DROPS = int(os.getenv("BASE_FEE_DROPS", "12"))
 MAX_FEE_DROPS = int(os.getenv("MAX_FEE_DROPS", "1200"))
 
@@ -72,6 +73,7 @@ print(f"Min Sell Floor:{TARGET_SELL_FLOOR_XRP} XRP ({TARGET_SELL_FLOOR_DROPS} dr
 print(f"Brokers:       {json.dumps(BROKERS)}")
 print(f"Max Active Buys:{MAX_ACTIVE_BUYS}")
 print(f"Buy Expiration:{BUY_OFFER_EXPIRATION_SEC} seconds")
+print(f"Auto Relist:   {AUTO_RELIST}")
 print(f"Relist Divisor:{RELIST_MARKUP_DIVISOR}")
 print(f"Base Fee:      {BASE_FEE_DROPS} drops")
 print(f"Max Fee Limit: {MAX_FEE_DROPS} drops")
@@ -662,8 +664,8 @@ def scan_and_sweep(api_data=None):
             local_free_bal -= required_drops
             
             relist_price_drops = max(TARGET_SELL_FLOOR_DROPS, int(paid_drops / RELIST_MARKUP_DIVISOR))
-            # Proactively list it if direct buy succeeded
-            if not destination:
+            # Proactively list it if direct buy succeeded and auto-relist is enabled
+            if AUTO_RELIST and not destination:
                 create_sell_offer(nftoken_id, relist_price_drops)
             
             # Stop sweeping further in this cycle to ensure we buy one at a time
@@ -674,6 +676,8 @@ def manage_inventory(active_offers):
     """
     Manage owned NFTs: Check if they are listed for sale at the correct price.
     """
+    if not AUTO_RELIST:
+        return
     print("[Inventory] Scanning owned NFTs to ensure they are listed at the floor...")
     global PURCHASE_PRICE_CACHE
     
