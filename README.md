@@ -76,6 +76,8 @@ Copy the generated `Secret Seed` and paste it as `XRPL_SEED` in your `.env`. Mak
 * `BUY_OFFER_EXPIRATION_SEC`: The duration in seconds before open buy offers automatically expire on-ledger (default is `600` / 10 minutes).
 * `RELIST_MARKUP_DIVISOR`: The margin divisor to protect listings from selling at a loss (default is `0.9` for a ~11% profit margin check).
 * `AUTO_RELIST`: Whether to automatically list swept/bought NFTs for sale (default is `True`). Set to `False` to run the bot in "sweeping-only" mode where it only sweeps cheap NFTs without placing sell offers or managing listing prices.
+* `PRIORITY_BUY_IDS`: A comma-separated list of NFTokenIDs. If any matching NFTs are listed below your target buy ceiling, the bot will prioritize purchasing them first, even if they aren't the cheapest NFTs in the collection.
+* `HOLD_IDS`: A comma-separated list of NFTokenIDs. The bot will never automatically list/relist these NFTs for sale, and it will never automatically cancel active buy offers (bids) placed on them, allowing you to secure and hold them.
 
 ---
 

@@ -52,6 +52,16 @@ MAX_ACTIVE_BUYS = int(os.getenv("MAX_ACTIVE_BUYS", "4"))
 BUY_OFFER_EXPIRATION_SEC = int(os.getenv("BUY_OFFER_EXPIRATION_SEC", "600"))
 RELIST_MARKUP_DIVISOR = float(os.getenv("RELIST_MARKUP_DIVISOR", "0.9"))
 AUTO_RELIST = os.getenv("AUTO_RELIST", "True").lower() == "true"
+
+def parse_id_list(env_var_name):
+    val = os.getenv(env_var_name, "").strip()
+    if not val:
+        return set()
+    return {x.strip() for x in val.split(",") if x.strip()}
+
+PRIORITY_BUY_IDS = parse_id_list("PRIORITY_BUY_IDS")
+HOLD_IDS = parse_id_list("HOLD_IDS")
+
 BASE_FEE_DROPS = int(os.getenv("BASE_FEE_DROPS", "12"))
 MAX_FEE_DROPS = int(os.getenv("MAX_FEE_DROPS", "1200"))
 
@@ -74,6 +84,8 @@ print(f"Brokers:       {json.dumps(BROKERS)}")
 print(f"Max Active Buys:{MAX_ACTIVE_BUYS}")
 print(f"Buy Expiration:{BUY_OFFER_EXPIRATION_SEC} seconds")
 print(f"Auto Relist:   {AUTO_RELIST}")
+print(f"Priority Buys: {len(PRIORITY_BUY_IDS)} items configured")
+print(f"Hold (No-Sell):{len(HOLD_IDS)} items configured")
 print(f"Relist Divisor:{RELIST_MARKUP_DIVISOR}")
 print(f"Base Fee:      {BASE_FEE_DROPS} drops")
 print(f"Max Fee Limit: {MAX_FEE_DROPS} drops")
@@ -409,6 +421,10 @@ def validate_and_cleanup_offers(api_data):
         nft_id = obj.get("NFTokenID")
         offer_index = obj.get("index")
         
+        # Skip validation and cleanup for hold list NFTs (keep buy and sell offers intact)
+        if nft_id in HOLD_IDS:
+            continue
+        
         # Check expiration first
         expiration = obj.get("Expiration")
         if expiration is not None and ripple_time > expiration:
@@ -618,8 +634,8 @@ def scan_and_sweep(api_data=None):
                     "broker_fee_mult": broker_fee_mult
                 })
                 
-    # 4. Sort candidates by total expected drops ascending (cheapest first!)
-    candidates.sort(key=lambda x: x["total_expected_drops"])
+    # 4. Sort candidates by priority list (first) and then total expected drops ascending
+    candidates.sort(key=lambda x: (x["nftoken_id"] not in PRIORITY_BUY_IDS, x["total_expected_drops"]))
     
     # 5. Get current free balance on-ledger once and track locally
     local_free_bal = get_free_balance()
@@ -664,8 +680,8 @@ def scan_and_sweep(api_data=None):
             local_free_bal -= required_drops
             
             relist_price_drops = max(TARGET_SELL_FLOOR_DROPS, int(paid_drops / RELIST_MARKUP_DIVISOR))
-            # Proactively list it if direct buy succeeded and auto-relist is enabled
-            if AUTO_RELIST and not destination:
+            # Proactively list it if direct buy succeeded and auto-relist is enabled (and not on hold list)
+            if AUTO_RELIST and nftoken_id not in HOLD_IDS and not destination:
                 create_sell_offer(nftoken_id, relist_price_drops)
             
             # Stop sweeping further in this cycle to ensure we buy one at a time
@@ -733,6 +749,11 @@ def manage_inventory(active_offers):
     
     for nft in collection_nfts:
         nft_id = nft.get("NFTokenID")
+        
+        # Skip hold list NFTs (never auto-sell or manage listings for them)
+        if nft_id in HOLD_IDS:
+            continue
+        
         
         # Get active sell offer from local lookup map
         our_active_offer = our_sell_offers.get(nft_id)
