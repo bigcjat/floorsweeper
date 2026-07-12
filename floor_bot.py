@@ -174,10 +174,25 @@ async def ensure_ticket_pool(client_obj):
     Check if available tickets are low and replenish the pool if necessary.
     """
     global AVAILABLE_TICKETS
+    
+    # Check liquid balance first. If below 10 XRP (10,000,000 drops), don't use or create tickets.
+    free_bal = await get_free_balance(client_obj)
+    if free_bal < 10_000_000:
+        AVAILABLE_TICKETS = []
+        return
+        
     AVAILABLE_TICKETS = await get_available_tickets(client_obj)
     
     # If tickets are low, top them up (target pool size: 30 tickets)
     if len(AVAILABLE_TICKETS) < 5:
+        tickets_needed = 30 - len(AVAILABLE_TICKETS)
+        required_reserve = tickets_needed * 200_000  # 0.2 XRP per ticket
+        
+        # Verify if free balance can cover the required reserve for the new tickets
+        if free_bal < (required_reserve + 2_000_000):  # reserve + 2 XRP safety buffer
+            print(f"[Tickets] Skip ticket creation. Balance too low to cover new ticket reserves ({free_bal / 1_000_000} XRP free).")
+            return
+            
         from xrpl.models.requests import AccountInfo
         try:
             resp = await client_obj.request(AccountInfo(account=wallet.classic_address))
@@ -215,6 +230,13 @@ async def get_next_ticket(client_obj):
     Pop the next ticket from the queue. Top up if empty.
     """
     global AVAILABLE_TICKETS
+    
+    # Check liquid balance first. If below 10 XRP, do not use tickets.
+    free_bal = await get_free_balance(client_obj)
+    if free_bal < 10_000_000:
+        AVAILABLE_TICKETS = []
+        return None
+
     if not AVAILABLE_TICKETS:
         try:
             await ensure_ticket_pool(client_obj)
