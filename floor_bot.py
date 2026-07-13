@@ -748,8 +748,11 @@ async def get_purchase_price_from_ledger(client_obj, http_client, nft_id):
                         if (fields.get("Owner") == wallet.classic_address and 
                             not (fields.get("Flags", 0) & 1)):
                             amount_val = fields.get("Amount")
-                            if isinstance(amount_val, str):
-                                return int(amount_val)
+                            if isinstance(amount_val, (str, int, float)):
+                                try:
+                                    return int(amount_val)
+                                except ValueError:
+                                    pass
                         
                         # Case 2: Direct Buy (we accepted the seller's sell offer)
                         # The transaction was sent by us (Account is us) and we accepted this sell offer
@@ -757,8 +760,11 @@ async def get_purchase_price_from_ledger(client_obj, http_client, nft_id):
                             tx.get("Account") == wallet.classic_address and 
                             deleted.get("LedgerIndex") == tx.get("NFTokenSellOffer")):
                             amount_val = fields.get("Amount")
-                            if isinstance(amount_val, str):
-                                return int(amount_val)
+                            if isinstance(amount_val, (str, int, float)):
+                                try:
+                                    return int(amount_val)
+                                except ValueError:
+                                    pass
                                 
     except Exception as e:
         raise ValueError(f"Error fetching NFT history from ledger: {e}")
@@ -783,7 +789,12 @@ async def process_single_nft_inventory(client_obj, http_client, nft, our_sell_of
         except Exception as e:
             if our_active_offer:
                 amount_val = our_active_offer.get("amount")
-                current_price = int(amount_val) / 1_000_000 if isinstance(amount_val, str) else 0.0
+                current_price = 0.0
+                if isinstance(amount_val, (str, int, float)):
+                    try:
+                        current_price = int(amount_val) / 1_000_000
+                    except ValueError:
+                        pass
                 print(f"[Inventory] NFT {nft_id} is already listed at {current_price} XRP. Purchase transaction not found; keeping active listing.")
                 return local_free_bal
             else:
@@ -796,7 +807,12 @@ async def process_single_nft_inventory(client_obj, http_client, nft, our_sell_of
             
     if our_active_offer:
         amount_val = our_active_offer.get("amount")
-        current_price_drops = int(amount_val) if isinstance(amount_val, str) else 0
+        current_price_drops = 0
+        if isinstance(amount_val, (str, int, float)):
+            try:
+                current_price_drops = int(amount_val)
+            except ValueError:
+                pass
         offer_id = our_active_offer.get("nft_offer_index")
         
         # Verify if listing price is correct
