@@ -856,7 +856,7 @@ async def manage_inventory(client_obj, http_client, active_offers):
     Manage owned NFTs: Check if they are listed for sale at the correct price.
     """
     if not AUTO_RELIST:
-        return
+        return [], {}
     print("[Inventory] Scanning owned NFTs to ensure they are listed at the floor...")
     global PURCHASE_PRICE_CACHE
     
@@ -872,7 +872,7 @@ async def manage_inventory(client_obj, http_client, active_offers):
                     print(f"[Inventory] Account {wallet.classic_address} is not active/funded on-ledger. Skipping inventory scan.")
                 else:
                     print(f"[Inventory Error] Failed to fetch account NFTs from ledger: {response.result.get('error_message', err_code)}")
-                return
+                return [], {}
             
             owned_nfts.extend(response.result.get("account_nfts", []))
             marker = response.result.get("marker")
@@ -880,7 +880,7 @@ async def manage_inventory(client_obj, http_client, active_offers):
                 break
     except Exception as e:
         print(f"[Inventory Error] Failed to fetch account NFTs: {e}")
-        return
+        return [], {}
         
     collection_nfts = [n for n in owned_nfts if n.get("Issuer") == ISSUER and n.get("NFTokenTaxon") == TAXON]
     print(f"[Inventory] Found {len(collection_nfts)} NFTs from target collection in wallet.")
@@ -923,10 +923,17 @@ async def manage_inventory(client_obj, http_client, active_offers):
     for nft in collection_nfts:
         local_free_bal = await process_single_nft_inventory(client_obj, http_client, nft, our_sell_offers, local_free_bal)
 
-async def scan_and_sweep(client_obj, http_client, api_data=None):
+    return collection_nfts, our_sell_offers
+
+async def scan_and_sweep(client_obj, http_client, api_data=None, collection_nfts=None, our_sell_offers=None):
     """
     Scan collection for deals and sweep them, processing multiple items concurrently.
     """
+    if collection_nfts is None:
+        collection_nfts = []
+    if our_sell_offers is None:
+        our_sell_offers = {}
+        
     if not api_data:
         api_data = await fetch_api_sell_offers(http_client)
         
@@ -1011,6 +1018,18 @@ async def scan_and_sweep(client_obj, http_client, api_data=None):
     
     # Get current free balance on-ledger
     local_free_bal = await get_free_balance(client_obj)
+
+    # 1. Determine how many owned collection NFTs do not have active sell offers
+    unlisted_count = 0
+    if collection_nfts:
+        unlisted_count = sum(1 for n in collection_nfts if n.get("NFTokenID") not in HOLD_IDS and n.get("NFTokenID") not in our_sell_offers)
+    
+    # 2. Reserve 0.2 XRP (200,000 drops) + transaction fee per unlisted NFT
+    tx_fee = int(calculate_tx_fee())
+    listing_reserve_drops = unlisted_count * (200_000 + tx_fee)
+    if listing_reserve_drops > 0:
+        print(f"[Sweep Reserve] Reserving {listing_reserve_drops / 1_000_000} XRP of free balance to list {unlisted_count} unlisted owned NFTs first.")
+        local_free_bal = max(0, local_free_bal - listing_reserve_drops)
     
     tasks = []
     # Process candidates in order of price, scheduling parallel sweeps up to limits
@@ -1101,10 +1120,13 @@ async def async_main():
                 active_offers = await validate_and_cleanup_offers(client_obj, api_data)
                 
                 # Step 4: Manage inventory and relist at correct floor
-                await manage_inventory(client_obj, http_client, active_offers)
+                collection_nfts = []
+                our_sell_offers = {}
+                if AUTO_RELIST:
+                    collection_nfts, our_sell_offers = await manage_inventory(client_obj, http_client, active_offers)
                 
                 # Step 5: Scan collection for deals and buy them
-                await scan_and_sweep(client_obj, http_client, api_data)
+                await scan_and_sweep(client_obj, http_client, api_data, collection_nfts, our_sell_offers)
                 
                 print(f"\nCycle complete. Waiting {POLL_INTERVAL} seconds...")
             except KeyboardInterrupt:
