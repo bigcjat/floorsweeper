@@ -534,6 +534,7 @@ async def validate_and_cleanup_offers(client_obj, api_data):
 
     # 2. Fetch all our active offers on-ledger (resilient with fallback to API data)
     objects = []
+    active_offers_failed = False
     try:
         marker = None
         while True:
@@ -546,13 +547,15 @@ async def validate_and_cleanup_offers(client_obj, api_data):
                     break
             else:
                 print(f"[Validation Warning] Failed to fetch active offers from ledger: {response.result}")
+                active_offers_failed = True
                 break
     except Exception as e:
         print(f"[Validation Warning] Exception querying active offers: {e}")
+        active_offers_failed = True
 
-    # Fallback/Supplemental: populate/supplement objects from api_data
-    existing_offer_indexes = {obj.get("index") for obj in objects if obj.get("index") is not None}
-    if api_data and "data" in api_data and "offers" in api_data["data"]:
+    # Fallback/Supplemental: populate/supplement objects from api_data ONLY if ledger query failed
+    if active_offers_failed and api_data and "data" in api_data and "offers" in api_data["data"]:
+        existing_offer_indexes = {obj.get("index") for obj in objects if obj.get("index") is not None}
         for item in api_data["data"]["offers"]:
             nft_id = item.get("NFTokenID")
             owner = item.get("NFTokenOwner")
@@ -573,7 +576,9 @@ async def validate_and_cleanup_offers(client_obj, api_data):
                         }
                         objects.append(mock_obj)
                         existing_offer_indexes.add(offer_id)
-        print(f"[Validation] Active offers list compiled: {len(objects)} total (including API fallback).")
+        print(f"[Validation] Active offers list compiled using API fallback: {len(objects)} total.")
+    else:
+        print(f"[Validation] Active offers list compiled from ledger: {len(objects)} total.")
 
 
     # Parse API listings for fast lookup
