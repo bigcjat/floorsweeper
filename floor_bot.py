@@ -590,9 +590,12 @@ async def validate_and_cleanup_offers(client_obj, api_data):
             best_sell = None
             for sell in sell_offers:
                 amount = sell.get("Amount")
-                if amount and isinstance(amount, str):
-                    price_drops = int(amount)
-                    if best_sell is None or price_drops < best_sell["price_drops"]:
+                if amount and isinstance(amount, (str, int, float)):
+                    try:
+                        price_drops = int(amount)
+                    except ValueError:
+                        price_drops = 0
+                    if price_drops > 0 and (best_sell is None or price_drops < best_sell["price_drops"]):
                         best_sell = {
                             "price_drops": price_drops,
                             "offer_id": sell.get("OfferID"),
@@ -655,7 +658,12 @@ async def validate_and_cleanup_offers(client_obj, api_data):
             
             # If listing price has changed and no longer matches our bid
             amount_val = obj.get("Amount")
-            current_bid = int(amount_val) if isinstance(amount_val, str) else 0
+            current_bid = 0
+            if isinstance(amount_val, (str, int, float)):
+                try:
+                    current_bid = int(amount_val)
+                except ValueError:
+                    pass
             if abs(current_bid - expected_bid) > 5:
                 print(f"[Validation] Buy offer for NFT {nft_id} has outdated bid ({current_bid / 1_000_000} XRP vs expected {expected_bid / 1_000_000} XRP). Scheduling cancel.")
                 offers_to_cancel.append(offer_index)
@@ -664,7 +672,15 @@ async def validate_and_cleanup_offers(client_obj, api_data):
     for nft_id, sell_list in nft_to_sell_offers.items():
         if len(sell_list) > 1:
             # Sort by price descending, then index (keep the highest/best offer, cancel others)
-            sell_list.sort(key=lambda x: int(x.get("Amount")) if isinstance(x.get("Amount"), str) else 0, reverse=True)
+            def get_amount(x):
+                val = x.get("Amount")
+                if isinstance(val, (str, int, float)):
+                    try:
+                        return int(val)
+                    except ValueError:
+                        return 0
+                return 0
+            sell_list.sort(key=get_amount, reverse=True)
             for dup in sell_list[1:]:
                 print(f"[Validation] Found duplicate sell offer for NFT {nft_id}. Scheduling cancel.")
                 offers_to_cancel.append(dup.get("index"))
@@ -931,11 +947,15 @@ async def scan_and_sweep(client_obj, http_client, api_data=None):
         sell_offers = nft_entry.get("sell", [])
         for offer in sell_offers:
             # We only look for XRP listings
-            price_str = offer.get("Amount")
-            if not isinstance(price_str, str):
+            price_val = offer.get("Amount")
+            if isinstance(price_val, (str, int, float)):
+                try:
+                    price_drops = int(price_val)
+                except ValueError:
+                    continue
+            else:
                 continue
                 
-            price_drops = int(price_str)
             if price_drops <= 0:
                 continue
                 
