@@ -507,9 +507,9 @@ async def validate_and_cleanup_offers(client_obj, api_data):
     3. Cancel buy offers that are expired, no longer listed under floor, or have incorrect amounts.
     """
     print("[Validation] Validating all active sell and buy offers on-ledger...")
+    # 1. Fetch owned NFTs from target collection (resilient with fallback to API data)
+    owned_nfts = []
     try:
-        # 1. Fetch owned NFTs from target collection
-        owned_nfts = []
         marker = None
         while True:
             request = AccountNFTs(account=wallet.classic_address, marker=marker)
@@ -520,12 +520,21 @@ async def validate_and_cleanup_offers(client_obj, api_data):
                 if not marker:
                     break
             else:
-                print(f"[Validation Error] Failed to fetch owned NFTs: {response.result}")
-                return []
-        owned_ids = {n.get("NFTokenID") for n in owned_nfts if n.get("Issuer") == ISSUER and n.get("NFTokenTaxon") == TAXON}
+                print(f"[Validation Warning] Failed to fetch owned NFTs from ledger: {response.result}")
+                break
+    except Exception as e:
+        print(f"[Validation Warning] Exception querying owned NFTs: {e}")
 
-        # 2. Fetch all our active offers on-ledger
-        objects = []
+    owned_ids = {n.get("NFTokenID") for n in owned_nfts if n.get("Issuer") == ISSUER and n.get("NFTokenTaxon") == TAXON}
+    
+    # Fallback: if we failed to query owned NFTs from the ledger, populate from xrpldata API
+    if not owned_ids and api_data and "data" in api_data and "offers" in api_data["data"]:
+        owned_ids = {item.get("NFTokenID") for item in api_data["data"]["offers"] if item.get("NFTokenOwner") == wallet.classic_address}
+        print(f"[Validation Fallback] Loaded {len(owned_ids)} owned NFT IDs from XRPData API.")
+
+    # 2. Fetch all our active offers on-ledger (resilient with fallback to API data)
+    objects = []
+    try:
         marker = None
         while True:
             request = AccountObjects(account=wallet.classic_address, type=AccountObjectType.NFT_OFFER, marker=marker)
@@ -536,11 +545,36 @@ async def validate_and_cleanup_offers(client_obj, api_data):
                 if not marker:
                     break
             else:
-                print(f"[Validation Error] Failed to fetch active offers: {response.result}")
-                return []
+                print(f"[Validation Warning] Failed to fetch active offers from ledger: {response.result}")
+                break
     except Exception as e:
-        print(f"[Validation Error] Failed to query ledger state: {e}")
-        return []
+        print(f"[Validation Warning] Exception querying active offers: {e}")
+
+    # Fallback/Supplemental: populate/supplement objects from api_data
+    existing_offer_indexes = {obj.get("index") for obj in objects if obj.get("index") is not None}
+    if api_data and "data" in api_data and "offers" in api_data["data"]:
+        for item in api_data["data"]["offers"]:
+            nft_id = item.get("NFTokenID")
+            owner = item.get("NFTokenOwner")
+            # If we own the NFT, any active sell offer belongs to us
+            if owner == wallet.classic_address:
+                sell_offers = item.get("sell", [])
+                for sell in sell_offers:
+                    offer_id = sell.get("OfferID")
+                    if offer_id not in existing_offer_indexes:
+                        mock_obj = {
+                            "Flags": 1,  # TF_SELL_NFTOKEN
+                            "NFTokenID": nft_id,
+                            "index": offer_id,
+                            "Amount": sell.get("Amount"),
+                            "Owner": owner,
+                            "Destination": sell.get("Destination"),
+                            "Expiration": sell.get("Expiration")
+                        }
+                        objects.append(mock_obj)
+                        existing_offer_indexes.add(offer_id)
+        print(f"[Validation] Active offers list compiled: {len(objects)} total (including API fallback).")
+
 
     # Parse API listings for fast lookup
     api_listings = {}
@@ -624,8 +658,8 @@ async def validate_and_cleanup_offers(client_obj, api_data):
     # Detect duplicate sell offers
     for nft_id, sell_list in nft_to_sell_offers.items():
         if len(sell_list) > 1:
-            # Sort by price ascending, then index (keep the lowest/best offer, cancel others)
-            sell_list.sort(key=lambda x: int(x.get("Amount")) if isinstance(x.get("Amount"), str) else float('inf'))
+            # Sort by price descending, then index (keep the highest/best offer, cancel others)
+            sell_list.sort(key=lambda x: int(x.get("Amount")) if isinstance(x.get("Amount"), str) else 0, reverse=True)
             for dup in sell_list[1:]:
                 print(f"[Validation] Found duplicate sell offer for NFT {nft_id}. Scheduling cancel.")
                 offers_to_cancel.append(dup.get("index"))
@@ -759,15 +793,24 @@ async def process_single_nft_inventory(client_obj, http_client, nft, our_sell_of
                 local_free_bal += (200_000 - tx_fee)
                 if await create_sell_offer(client_obj, nft_id, target_relist_price):
                     local_free_bal -= (200_000 + tx_fee)
+                else:
+                    print(f"[Inventory] Relisting failed to create new offer on-ledger. Aborting further listing attempts in this cycle to prevent ledger spam.")
+                    local_free_bal = 0
+            else:
+                print(f"[Inventory] Relisting failed to cancel old offer on-ledger. Aborting further listing attempts in this cycle to prevent ledger spam.")
+                local_free_bal = 0
     else:
         # No active sell offer from us on-ledger. Create one!
         if local_free_bal < (200_000 + tx_fee):
             print(f"[Inventory] Insufficient reserve to list NFT {nft_id}. Free: {local_free_bal / 1_000_000} XRP. Skipping.")
             return local_free_bal
             
-            print(f"[Inventory] NFT {nft_id} is not currently listed. Creating sell listing...")
+        print(f"[Inventory] NFT {nft_id} is not currently listed. Creating sell listing...")
         if await create_sell_offer(client_obj, nft_id, target_relist_price):
             local_free_bal -= (200_000 + tx_fee)
+        else:
+            print(f"[Inventory] Listing failed. Aborting further listing attempts in this cycle to prevent ledger spam.")
+            local_free_bal = 0
             
     return local_free_bal
 
