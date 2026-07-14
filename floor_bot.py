@@ -85,32 +85,6 @@ MAX_FEE_DROPS = int(os.getenv("MAX_FEE_DROPS", "1200"))
 TARGET_BUY_FLOOR_DROPS = int(TARGET_BUY_FLOOR_XRP * 1_000_000)
 TARGET_SELL_FLOOR_DROPS = int(TARGET_SELL_FLOOR_XRP * 1_000_000)
 
-# In-memory and persistent cache to prevent redundant on-ledger history scans
-CACHE_FILE = "purchase_price_cache.json"
-PURCHASE_PRICE_CACHE = {}
-
-def load_purchase_price_cache():
-    global PURCHASE_PRICE_CACHE
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r") as f:
-                PURCHASE_PRICE_CACHE = json.load(f)
-            print(f"[Cache] Loaded {len(PURCHASE_PRICE_CACHE)} cached purchase prices from '{CACHE_FILE}'.")
-        except Exception as e:
-            print(f"[Cache Warning] Failed to load cache file: {e}")
-            PURCHASE_PRICE_CACHE = {}
-    else:
-        PURCHASE_PRICE_CACHE = {}
-
-def save_purchase_price_cache():
-    try:
-        with open(CACHE_FILE, "w") as f:
-            json.dump(PURCHASE_PRICE_CACHE, f, indent=2)
-    except Exception as e:
-        print(f"[Cache Warning] Failed to save cache file: {e}")
-
-load_purchase_price_cache()
-
 # Ticket queue state
 AVAILABLE_TICKETS = []
 
@@ -794,82 +768,39 @@ async def get_purchase_price_from_ledger(client_obj, http_client, nft_id):
 
 async def process_single_nft_inventory(client_obj, http_client, nft, our_sell_offers, local_free_bal):
     """
-    Process listings and pricing checks for a single owned NFT.
+    Process listings for a single owned NFT.
     """
     nft_id = nft.get("NFTokenID")
     if nft_id in HOLD_IDS:
         return local_free_bal
 
     our_active_offer = our_sell_offers.get(nft_id)
-    cost_drops = PURCHASE_PRICE_CACHE.get(nft_id)
-    
-    if cost_drops is None:
-        try:
-            cost_drops = await get_purchase_price_from_ledger(client_obj, http_client, nft_id)
-            PURCHASE_PRICE_CACHE[nft_id] = cost_drops
-        except Exception as e:
-            if our_active_offer:
-                amount_val = our_active_offer.get("amount")
-                current_price = 0.0
-                if isinstance(amount_val, (str, int, float)):
-                    try:
-                        current_price = int(amount_val) / 1_000_000
-                    except ValueError:
-                        pass
-                print(f"[Inventory] NFT {nft_id} is already listed at {current_price} XRP. Purchase transaction not found; keeping active listing.")
-                return local_free_bal
-            else:
-                print(f"[CRITICAL ERROR] Failed to determine cost for unlisted NFT {nft_id}: {e}")
-                print(f"                 Skipping listing to prevent listing at a loss.")
-                return local_free_bal
-                    
+    if our_active_offer:
+        # NFT is already listed. We don't need to check its purchase price or verify its listing price.
+        return local_free_bal
+
+    # Not listed, we need to fetch purchase price to set listing price
+    try:
+        cost_drops = await get_purchase_price_from_ledger(client_obj, http_client, nft_id)
+    except Exception as e:
+        print(f"[CRITICAL ERROR] Failed to determine cost for unlisted NFT {nft_id}: {e}")
+        print(f"                 Skipping listing to prevent listing at a loss.")
+        return local_free_bal
+
     target_relist_price = max(TARGET_SELL_FLOOR_DROPS, int(cost_drops / RELIST_MARKUP_DIVISOR))
     tx_fee = int(calculate_tx_fee())
-            
-    if our_active_offer:
-        amount_val = our_active_offer.get("amount")
-        current_price_drops = 0
-        if isinstance(amount_val, (str, int, float)):
-            try:
-                current_price_drops = int(amount_val)
-            except ValueError:
-                pass
-        offer_id = our_active_offer.get("nft_offer_index")
+
+    if local_free_bal < (200_000 + tx_fee):
+        print(f"[Inventory] Insufficient reserve to list NFT {nft_id}. Free: {local_free_bal / 1_000_000} XRP. Skipping.")
+        return local_free_bal
         
-        # Verify if listing price is correct
-        if current_price_drops != target_relist_price:
-            # Pre-flight reserve check before relisting (need 0.2 XRP reserve + fee)
-            if local_free_bal < (200_000 + tx_fee):
-                print(f"[Inventory] Insufficient reserve to relist NFT {nft_id}. Free: {local_free_bal / 1_000_000} XRP. Skipping.")
-                return local_free_bal
-            
-            print(f"[Inventory] NFT {nft_id} is listed at incorrect price: {current_price_drops / 1_000_000} XRP.")
-            print(f"            Target price: {target_relist_price / 1_000_000} XRP. Relisting...")
-            
-            # Cancel old offer and create new one
-            if await cancel_sell_offer(client_obj, offer_id, nft_id):
-                local_free_bal += (200_000 - tx_fee)
-                if await create_sell_offer(client_obj, nft_id, target_relist_price):
-                    local_free_bal -= (200_000 + tx_fee)
-                else:
-                    print(f"[Inventory] Relisting failed to create new offer on-ledger. Aborting further listing attempts in this cycle to prevent ledger spam.")
-                    local_free_bal = 0
-            else:
-                print(f"[Inventory] Relisting failed to cancel old offer on-ledger. Aborting further listing attempts in this cycle to prevent ledger spam.")
-                local_free_bal = 0
+    print(f"[Inventory] NFT {nft_id} is not currently listed. Creating sell listing at {target_relist_price / 1_000_000} XRP...")
+    if await create_sell_offer(client_obj, nft_id, target_relist_price):
+        local_free_bal -= (200_000 + tx_fee)
     else:
-        # No active sell offer from us on-ledger. Create one!
-        if local_free_bal < (200_000 + tx_fee):
-            print(f"[Inventory] Insufficient reserve to list NFT {nft_id}. Free: {local_free_bal / 1_000_000} XRP. Skipping.")
-            return local_free_bal
-            
-        print(f"[Inventory] NFT {nft_id} is not currently listed. Creating sell listing...")
-        if await create_sell_offer(client_obj, nft_id, target_relist_price):
-            local_free_bal -= (200_000 + tx_fee)
-        else:
-            print(f"[Inventory] Listing failed. Aborting further listing attempts in this cycle to prevent ledger spam.")
-            local_free_bal = 0
-            
+        print(f"[Inventory] Listing failed. Aborting further listing attempts in this cycle to prevent ledger spam.")
+        local_free_bal = 0
+
     return local_free_bal
 
 async def manage_inventory(client_obj, http_client, active_offers):
@@ -879,7 +810,6 @@ async def manage_inventory(client_obj, http_client, active_offers):
     if not AUTO_RELIST:
         return [], {}
     print("[Inventory] Scanning owned NFTs to ensure they are listed at the floor...")
-    global PURCHASE_PRICE_CACHE
     
     owned_nfts = []
     marker = None
@@ -922,23 +852,6 @@ async def manage_inventory(client_obj, http_client, active_offers):
                 }
     
     local_free_bal = await get_free_balance(client_obj)
-    
-    # Pre-fetch missing purchase history concurrently to optimize API roundtrips
-    nfts_to_fetch = [n for n in collection_nfts if n.get("NFTokenID") not in HOLD_IDS and PURCHASE_PRICE_CACHE.get(n.get("NFTokenID")) is None]
-    if nfts_to_fetch:
-        print(f"[Inventory] Querying Clio history for {len(nfts_to_fetch)} NFTs (max concurrency: 3)...")
-        sem = asyncio.Semaphore(3)
-        async def fetch_single_price(nft_item):
-            n_id = nft_item.get("NFTokenID")
-            print(f"[Inventory Debug] fetch_single_price entered for {n_id}")
-            async with sem:
-                try:
-                    price = await get_purchase_price_from_ledger(client_obj, http_client, n_id)
-                    PURCHASE_PRICE_CACHE[n_id] = price
-                except Exception as e:
-                    print(f"[Inventory Warning] Failed to fetch price for {n_id}: {e}")
-        await asyncio.gather(*(fetch_single_price(n) for n in nfts_to_fetch))
-        save_purchase_price_cache()
     
     # Process listing transactions sequentially to prevent Ticket Sequence race conditions
     for nft in collection_nfts:
