@@ -15,7 +15,9 @@ from xrpl.models.transactions import (
     NFTokenCreateOffer,
     NFTokenCreateOfferFlag,
     NFTokenCancelOffer,
-    TicketCreate
+    TicketCreate,
+    Payment,
+    CheckCreate
 )
 from xrpl.asyncio.transaction import submit_and_wait
 
@@ -54,6 +56,18 @@ MAX_ACTIVE_BUYS = int(os.getenv("MAX_ACTIVE_BUYS", "4"))
 BUY_OFFER_EXPIRATION_SEC = int(os.getenv("BUY_OFFER_EXPIRATION_SEC", "600"))
 RELIST_MARKUP_DIVISOR = float(os.getenv("RELIST_MARKUP_DIVISOR", "0.9"))
 AUTO_RELIST = os.getenv("AUTO_RELIST", "True").lower() == "true"
+
+# Operational Modes & Profit Collector Configuration
+BOT_MODE = os.getenv("BOT_MODE", "REINVEST").strip().upper()
+MAX_OWNED_LIMIT = int(os.getenv("MAX_OWNED_LIMIT", "50"))
+PROFIT_TARGET_WALLET = os.getenv("PROFIT_TARGET_WALLET", "").strip()
+PROFIT_TRANSFER_METHOD = os.getenv("PROFIT_TRANSFER_METHOD", "PAYMENT").strip().upper()
+MIN_OPERATING_BUFFER_XRP = float(os.getenv("MIN_OPERATING_BUFFER_XRP", "30.0"))
+PROFIT_SWEEP_MIN_TRIGGER_XRP = float(os.getenv("PROFIT_SWEEP_MIN_TRIGGER_XRP", "5.0"))
+
+if BOT_MODE == "COLLECT_PROFIT" and not PROFIT_TARGET_WALLET:
+    print("[Warning] BOT_MODE is COLLECT_PROFIT but PROFIT_TARGET_WALLET is not configured. Falling back to REINVEST mode.")
+    BOT_MODE = "REINVEST"
 
 def parse_id_list(env_var_name):
     val = os.getenv(env_var_name, "").strip()
@@ -119,6 +133,13 @@ print(f"Base Fee:      {BASE_FEE_DROPS} drops")
 print(f"Max Fee Limit: {MAX_FEE_DROPS} drops")
 print(f"Dry Run Mode:  {DRY_RUN}")
 print(f"Poll Interval: {POLL_INTERVAL} seconds")
+print(f"Bot Mode:      {BOT_MODE}")
+if BOT_MODE == "COLLECT_PROFIT":
+    print(f"Max Owned Limit:{MAX_OWNED_LIMIT}")
+    print(f"Profit Target: {PROFIT_TARGET_WALLET}")
+    print(f"Sweep Method:  {PROFIT_TRANSFER_METHOD}")
+    print(f"Operating Buffer: {MIN_OPERATING_BUFFER_XRP} XRP")
+    print(f"Min Sweep Trigger: {PROFIT_SWEEP_MIN_TRIGGER_XRP} XRP")
 
 # Wallet Initialization
 seed = os.getenv("XRPL_SEED", "").strip()
@@ -934,6 +955,13 @@ async def scan_and_sweep(client_obj, http_client, api_data=None, collection_nfts
     if our_sell_offers is None:
         our_sell_offers = {}
         
+    # Check inventory limit if in COLLECT_PROFIT mode
+    if BOT_MODE == "COLLECT_PROFIT":
+        currently_owned = len(collection_nfts)
+        if currently_owned >= MAX_OWNED_LIMIT:
+            print(f"[Collector Limit] Max inventory limit reached ({currently_owned}/{MAX_OWNED_LIMIT} owned). Skipping sweeps in this cycle.")
+            return
+        
     if not api_data:
         api_data = await fetch_api_sell_offers(http_client)
         
@@ -1088,6 +1116,64 @@ async def scan_and_sweep(client_obj, http_client, api_data=None, collection_nfts
         print(f"[Sweep] Executing {len(tasks)} sweeps concurrently in this cycle using Ticket sequences...")
         await asyncio.gather(*(t[1] for t in tasks))
 
+async def manage_profits(client_obj):
+    """
+    Identify and sweep surplus profits to cold wallet if threshold is met.
+    """
+    if BOT_MODE != "COLLECT_PROFIT":
+        return
+
+    try:
+        # 1. Fetch live balance
+        current_drops = await get_free_balance(client_obj)
+        current_xrp = current_drops / 1_000_000
+        
+        # 2. Calculate surplus
+        surplus_xrp = current_xrp - MIN_OPERATING_BUFFER_XRP
+        
+        if surplus_xrp >= PROFIT_SWEEP_MIN_TRIGGER_XRP:
+            # We have a surplus that meets the trigger threshold!
+            sweep_drops = int(surplus_xrp * 1_000_000)
+            print(f"[Profit Collector] Surplus detected: {surplus_xrp:.6f} XRP (Trigger threshold: {PROFIT_SWEEP_MIN_TRIGGER_XRP} XRP).")
+            print(f"                  Initiating profit sweep of {surplus_xrp:.6f} XRP to {PROFIT_TARGET_WALLET} using {PROFIT_TRANSFER_METHOD}...")
+            
+            # Fetch fresh sequence/ticket to prevent collisions
+            seq, ticket = await get_tx_sequence_and_ticket(client_obj)
+            tx_fee = calculate_tx_fee()
+            
+            if PROFIT_TRANSFER_METHOD == "CHECK":
+                tx = CheckCreate(
+                    account=wallet.classic_address,
+                    destination=PROFIT_TARGET_WALLET,
+                    send_max=str(sweep_drops),
+                    sequence=seq,
+                    ticket_sequence=ticket,
+                    fee=tx_fee
+                )
+            else:
+                tx = Payment(
+                    account=wallet.classic_address,
+                    destination=PROFIT_TARGET_WALLET,
+                    amount=str(sweep_drops),
+                    sequence=seq,
+                    ticket_sequence=ticket,
+                    fee=tx_fee
+                )
+                
+            if not DRY_RUN:
+                response = await submit_and_wait(tx, client_obj, wallet)
+                if response.is_successful() and response.result.get("meta", {}).get("TransactionResult") == "tesSUCCESS":
+                    print(f"[Success] Profit sweep transaction completed successfully.")
+                else:
+                    res_code = response.result.get("meta", {}).get("TransactionResult", "Unknown")
+                    print(f"[Error] Profit sweep transaction failed. Result code: {res_code}")
+            else:
+                print(f"[DRY RUN] Would submit {PROFIT_TRANSFER_METHOD} to send {surplus_xrp:.6f} XRP to {PROFIT_TARGET_WALLET} (Ticket: {ticket})")
+        else:
+            pass
+    except Exception as e:
+        print(f"[Profit Collector Error] Exception occurred during profit sweeping: {e}")
+
 async def async_main():
     """
     Main asynchronous loop of the bot.
@@ -1127,6 +1213,9 @@ async def async_main():
                 
                 # Step 5: Scan collection for deals and buy them
                 await scan_and_sweep(client_obj, http_client, api_data, collection_nfts, our_sell_offers)
+                
+                # Step 6: Sweep surplus profits to cold wallet if configured
+                await manage_profits(client_obj)
                 
                 print(f"\nCycle complete. Waiting {POLL_INTERVAL} seconds...")
             except KeyboardInterrupt:
