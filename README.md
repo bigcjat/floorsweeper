@@ -91,6 +91,19 @@ Copy the generated `Secret Seed` and paste it as `XRPL_SEED` in your `.env`. Mak
 * `BASE_FEE_DROPS`: The baseline transaction fee (default is `12` drops).
 * `MAX_FEE_DROPS`: The maximum transaction fee you are willing to pay during network fee escalation (default is `1200` drops).
 
+### Operational Modes & Profit Collector Configuration
+* `BOT_MODE`: The operational mode of the bot.
+  * `REINVEST`: (Default) The bot continuously sweeps any collection NFTs listed below your target buy floor.
+  * `COLLECT_PROFIT`: The bot holds a capped inventory of collection NFTs and routes excess XRP profits to a secure cold wallet.
+* `MAX_OWNED_LIMIT`: The maximum number of collection NFTs to hold in your hot wallet before pausing sweeps (only used in `COLLECT_PROFIT` mode; defaults to `10000`).
+* `PROFIT_TARGET_WALLET`: The classic address of the cold/recipient wallet where surplus XRP profit will be automatically transferred.
+* `PROFIT_TRANSFER_METHOD`: The XRPL transaction method used to sweep profits:
+  * `PAYMENT`: (Default) Submits standard direct XRP `Payment` transactions to the target wallet.
+  * `CHECK`: Submits native `CheckCreate` transactions, allowing the cold wallet to cash the check at its convenience.
+* `MIN_OPERATING_BUFFER_XRP`: The minimum free XRP balance to retain in the hot wallet for reserves/fees/tickets (only used in `COLLECT_PROFIT` mode; default is `30.0` XRP).
+* `PROFIT_SWEEP_MIN_TRIGGER_XRP`: The minimum surplus XRP required to trigger a transfer, preventing transaction history spam (default is `5.0` XRP).
+
+
 
 ---
 
