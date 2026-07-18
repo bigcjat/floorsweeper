@@ -910,6 +910,10 @@ async def scan_and_sweep(client_obj, http_client, api_data=None, collection_nfts
             
         sell_offers = nft_entry.get("sell", [])
         for offer in sell_offers:
+            # Skip stale offers created by previous owners who no longer own the NFT
+            if offer.get("Owner") != owner:
+                continue
+                
             # We only look for XRP listings
             price_val = offer.get("Amount")
             if isinstance(price_val, (str, int, float)):
