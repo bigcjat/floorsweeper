@@ -581,9 +581,14 @@ async def validate_and_cleanup_offers(client_obj, api_data):
     if api_data and "data" in api_data and "offers" in api_data["data"]:
         for item in api_data["data"]["offers"]:
             nft_id = item.get("NFTokenID")
+            nft_owner = item.get("NFTokenOwner")
             sell_offers = item.get("sell", [])
             best_sell = None
             for sell in sell_offers:
+                # Filter out stale sell offers from previous owners
+                if sell.get("Owner") != nft_owner:
+                    continue
+                    
                 amount = sell.get("Amount")
                 if amount and isinstance(amount, (str, int, float)):
                     try:
