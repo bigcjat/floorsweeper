@@ -87,6 +87,7 @@ TARGET_SELL_FLOOR_DROPS = int(TARGET_SELL_FLOOR_XRP * 1_000_000)
 
 # Ticket queue state
 AVAILABLE_TICKETS = []
+PURCHASE_COST_CACHE = {}
 
 print("=" * 80)
 print("              XRPL NFT FLOOR SWEEPER & RELISTING BOT")
@@ -347,6 +348,68 @@ def calculate_relist_price(nft_id, cost_drops):
 
     target_price = int(cost_drops / divisor)
     return max(TARGET_SELL_FLOOR_DROPS, target_price)
+
+async def populate_purchase_cost_cache(client_obj):
+    """
+    Fetch the account's transaction history on startup and trace purchase costs
+    for currently owned NFTs, storing them in the global PURCHASE_COST_CACHE.
+    """
+    global PURCHASE_COST_CACHE
+    print("[Cost Cache] Initializing purchase cost cache from ledger history...")
+    all_txs = []
+    marker = None
+    try:
+        while True:
+            from xrpl.models.requests import AccountTx
+            req = AccountTx(account=wallet.classic_address, marker=marker)
+            res = await client_obj.request(req)
+            if not res.is_successful():
+                print(f"[Cost Cache Warning] Failed to fetch transactions: {res.result}")
+                break
+            all_txs.extend(res.result.get("transactions", []))
+            marker = res.result.get("marker")
+            if not marker:
+                break
+    except Exception as e:
+        print(f"[Cost Cache Warning] Exception querying history: {e}")
+        return
+
+    # Build cost mapping (newest transaction first, so we only store the newest buy price)
+    for tx_wrapper in all_txs:
+        tx = tx_wrapper.get("tx_json", tx_wrapper.get("tx", {}))
+        meta = tx_wrapper.get("meta", {})
+        
+        if meta.get("TransactionResult") == "tesSUCCESS":
+            tx_type = tx.get("TransactionType")
+            account = tx.get("Account", "")
+            
+            # Case A: We accepted a sell offer (bought or transferred)
+            if tx_type == "NFTokenAcceptOffer" and account == wallet.classic_address:
+                for node in meta.get("AffectedNodes", []):
+                    deleted = node.get("DeletedNode", {})
+                    if deleted.get("LedgerEntryType") == "NFTokenOffer":
+                        fields = deleted.get("FinalFields", {})
+                        nft_id = fields.get("NFTokenID")
+                        if nft_id and nft_id not in PURCHASE_COST_CACHE:
+                            owner = fields.get("Owner", "")
+                            amount_val = fields.get("Amount", "0")
+                            if owner.lower().startswith("rkinwuk"):
+                                PURCHASE_COST_CACHE[nft_id] = 5_000_000 # 5 XRP
+                            else:
+                                PURCHASE_COST_CACHE[nft_id] = int(amount_val)
+
+            # Case B: Someone accepted our buy offer (we bought)
+            if tx_type == "NFTokenAcceptOffer":
+                for node in meta.get("AffectedNodes", []):
+                    deleted = node.get("DeletedNode", {})
+                    if deleted.get("LedgerEntryType") == "NFTokenOffer":
+                        fields = deleted.get("FinalFields", {})
+                        nft_id = fields.get("NFTokenID")
+                        if nft_id and nft_id not in PURCHASE_COST_CACHE and fields.get("Owner") == wallet.classic_address and not (fields.get("Flags", 0) & 1):
+                            amount_val = fields.get("Amount", "0")
+                            PURCHASE_COST_CACHE[nft_id] = int(amount_val)
+
+    print(f"[Cost Cache] Initialized cache with {len(PURCHASE_COST_CACHE)} known NFT purchase costs.")
 
 async def execute_direct_buy(client_obj, offer_id, nftoken_id, price_drops):
     """
@@ -654,7 +717,22 @@ async def validate_and_cleanup_offers(client_obj, api_data):
                 print(f"[Validation] Found orphan sell offer for NFT {nft_id} (not owned by us). Scheduling cancel.")
                 offers_to_cancel.append(offer_index)
             else:
-                nft_to_sell_offers.setdefault(nft_id, []).append(obj)
+                # Auto-Alignment check: verify that the live price matches our current target price
+                cost_drops = PURCHASE_COST_CACHE.get(nft_id, 5_000_000) # Default to 5.0 XRP if unknown
+                target_relist_price = calculate_relist_price(nft_id, cost_drops)
+                current_price = 0
+                amount_val = obj.get("Amount")
+                if isinstance(amount_val, (str, int, float)):
+                    try:
+                        current_price = int(amount_val)
+                    except ValueError:
+                        pass
+                
+                if current_price != target_relist_price:
+                    print(f"[Validation] NFT {nft_id} listing price is out of alignment: active {current_price / 1_000_000} XRP vs target {target_relist_price / 1_000_000} XRP. Scheduling cancel to relist.")
+                    offers_to_cancel.append(offer_index)
+                else:
+                    nft_to_sell_offers.setdefault(nft_id, []).append(obj)
         else:
             # Buy offer check
             if nft_id in owned_ids:
@@ -736,6 +814,9 @@ async def get_purchase_price_from_ledger(client_obj, http_client, nft_id):
     Query Clio's nft_history command for the specific NFT to find the exact drops we paid.
     Raises ValueError if the transaction cannot be found on-ledger.
     """
+    if nft_id in PURCHASE_COST_CACHE:
+        return PURCHASE_COST_CACHE[nft_id]
+
     try:
         # Submit raw JSON-RPC request to XRPL_NODE for nft_history
         payload = {
@@ -1049,6 +1130,7 @@ async def scan_and_sweep(client_obj, http_client, api_data=None, collection_nfts
                 success, paid_drops = await execute_brokered_buy(client_obj, own_addr, nft_id, pr_drops, broker_mult)
             
             if success:
+                PURCHASE_COST_CACHE[nft_id] = paid_drops
                 relist_price_drops = calculate_relist_price(nft_id, paid_drops)
                 if AUTO_RELIST and nft_id not in HOLD_IDS and not dest_addr:
                     await create_sell_offer(client_obj, nft_id, relist_price_drops)
@@ -1128,6 +1210,9 @@ async def async_main():
     except Exception as e:
         print(f"[CRITICAL ERROR] Failed to connect to XRPL node {XRPL_NODE}: {e}")
         sys.exit(1)
+
+    # Populate the global purchase cost cache on startup
+    await populate_purchase_cost_cache(client_obj)
 
     async with httpx.AsyncClient() as http_client:
         while True:
