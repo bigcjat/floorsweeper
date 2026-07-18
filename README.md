@@ -13,7 +13,9 @@ This automated bot runs in the background to monitor a specific XLS-20 NFT colle
 * **Fully Asynchronous Execution**: Built using `asyncio` and `httpx` to execute network operations in parallel, drastically reducing execution latency.
 * **Multi-Sweep & Concurrency**: Sweeps and lists multiple NFTs in parallel by utilizing XRPL **Tickets**. This allows the bot to process transactions simultaneously without sequence collisions.
 * **Auto-Replenishing Ticket Engine**: Monitors your wallet's ticket count. When active tickets drop below 5, it submits a batched `TicketCreate` transaction to top the pool back up to 30. Safely falls back to standard sequential account sequence numbers if tickets cannot be created.
-* **Persistent Clio History Cache**: Caches Clio transaction histories locally in `purchase_price_cache.json`. This reduces startup overhead, completely prevents public node rate-limiting (`503 Service Unavailable` errors), and reduces inventory validation checks to under a second.
+* **Startup Transaction Cost Cache**: Scans your account's historical transactions once on startup to build an in-memory cache of purchase costs. This completely eliminates public node rate-limiting (`503 Service Unavailable`) on `nft_history` and reduces cycle validation to under a second.
+* **Dynamic Royalty Protection**: Dynamically extracts the NFT's creator royalty (`TransferFee`) directly from characters 4 to 7 of the `NFTokenID` hex string. Automatically increases the listing price so you receive exactly your target net profit margin after royalties and broker fees are paid.
+* **Continuous Auto-Alignment**: Continuously validates active on-ledger listings. If you change target floor settings or the markup divisor in `.env`, the bot will automatically cancel and relist out-of-sync listings on the next cycle.
 * **Dynamic Fee Bounding**: Dynamically queries ledger transaction fees once per cycle to automatically scale transaction fees safely during network congestion.
 
 ---
@@ -84,7 +86,7 @@ Copy the generated `Secret Seed` and paste it as `XRPL_SEED` in your `.env`. Mak
 * `BROKERS_CONFIG`: A JSON-formatted mapping string of supported broker addresses to their fee multipliers (e.g., `'{"rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC": 1.01589}'` to cover XRP Cafe's `1.589%` broker fee). Bypasses and ignores private offers pointing to other destination addresses.
 * `MAX_ACTIVE_BUYS`: The maximum number of active buy bids the bot is allowed to keep open on-ledger simultaneously (default is `4`).
 * `BUY_OFFER_EXPIRATION_SEC`: The duration in seconds before open buy offers automatically expire on-ledger (default is `600` / 10 minutes).
-* `RELIST_MARKUP_DIVISOR`: The margin divisor to protect listings from selling at a loss (default is `0.9` for a ~11% profit margin check).
+* `RELIST_MARKUP_DIVISOR`: The target net profit margin divisor (default is `0.8` for a guaranteed 25% net profit margin after creator royalties and broker fees are paid).
 * `AUTO_RELIST`: Whether to automatically list swept/bought NFTs for sale (default is `True`). Set to `False` to run the bot in "sweeping-only" mode where it only sweeps cheap NFTs without placing sell offers or managing listing prices.
 * `PRIORITY_BUY_IDS`: A comma-separated list of NFTokenIDs. If any matching NFTs are listed below your target buy ceiling, the bot will prioritize purchasing them first, even if they aren't the cheapest NFTs in the collection.
 * `HOLD_IDS`: A comma-separated list of NFTokenIDs. The bot will never automatically list/relist these NFTs for sale, and it will never automatically cancel active buy offers (bids) placed on them, allowing you to secure and hold them.
