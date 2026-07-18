@@ -327,6 +327,27 @@ async def get_free_balance(client_obj):
         print(f"[Warning] Failed to calculate free balance: {e}")
     return 0
 
+def calculate_relist_price(nft_id, cost_drops):
+    """
+    Calculate target relist price dynamically based on NFT's on-ledger royalty (TransferFee)
+    and our RELIST_MARKUP_DIVISOR.
+    """
+    try:
+        # Extract TransferFee (royalty) from NFTokenID (chars 4 to 7 in hex string)
+        fee_hex = nft_id[4:8]
+        fee_val = int(fee_hex, 16)
+        royalty_pct = fee_val / 100000.0  # Max 0.50 (50%)
+    except Exception:
+        royalty_pct = 0.0
+
+    # Avoid divide by zero or negative divisor
+    divisor = RELIST_MARKUP_DIVISOR * (1.0 - royalty_pct)
+    if divisor <= 0.05:
+        divisor = 0.05
+
+    target_price = int(cost_drops / divisor)
+    return max(TARGET_SELL_FLOOR_DROPS, target_price)
+
 async def execute_direct_buy(client_obj, offer_id, nftoken_id, price_drops):
     """
     Purchase an NFT directly from a public sell offer.
@@ -792,7 +813,7 @@ async def process_single_nft_inventory(client_obj, http_client, nft, our_sell_of
         print(f"                 Skipping listing to prevent listing at a loss.")
         return local_free_bal
 
-    target_relist_price = max(TARGET_SELL_FLOOR_DROPS, int(cost_drops / RELIST_MARKUP_DIVISOR))
+    target_relist_price = calculate_relist_price(nft_id, cost_drops)
     tx_fee = int(calculate_tx_fee())
 
     if local_free_bal < (200_000 + tx_fee):
@@ -1028,7 +1049,7 @@ async def scan_and_sweep(client_obj, http_client, api_data=None, collection_nfts
                 success, paid_drops = await execute_brokered_buy(client_obj, own_addr, nft_id, pr_drops, broker_mult)
             
             if success:
-                relist_price_drops = max(TARGET_SELL_FLOOR_DROPS, int(paid_drops / RELIST_MARKUP_DIVISOR))
+                relist_price_drops = calculate_relist_price(nft_id, paid_drops)
                 if AUTO_RELIST and nft_id not in HOLD_IDS and not dest_addr:
                     await create_sell_offer(client_obj, nft_id, relist_price_drops)
 
