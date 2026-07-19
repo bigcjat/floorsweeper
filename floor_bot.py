@@ -461,19 +461,22 @@ async def execute_direct_buy(client_obj, offer_id, nftoken_id, price_drops):
         return False, 0
 
     seq, ticket = await get_tx_sequence_and_ticket(client_obj)
-    tx = NFTokenAcceptOffer(
-        account=wallet.classic_address,
-        nftoken_sell_offer=offer_id,
-        sequence=seq,
-        ticket_sequence=ticket,
-        fee=calculate_tx_fee()
-    )
-    
+    if seq is None and ticket is None:
+        print("[Error] Failed to acquire valid sequence or ticket for direct buy.")
+        return False, 0
+
     if DRY_RUN:
         print(f"[DRY RUN] Would submit NFTokenAcceptOffer (Ticket: {ticket}) for SellOfferID: {offer_id}")
         return True, price_drops
     
     try:
+        tx = NFTokenAcceptOffer(
+            account=wallet.classic_address,
+            nftoken_sell_offer=offer_id,
+            sequence=seq,
+            ticket_sequence=ticket,
+            fee=calculate_tx_fee()
+        )
         response = await submit_and_wait(tx, client_obj, wallet)
         if response.is_successful() and response.result.get("meta", {}).get("TransactionResult") == "tesSUCCESS":
             print(f"[Success] Successfully purchased NFT {nftoken_id}!")
@@ -504,22 +507,25 @@ async def execute_brokered_buy(client_obj, owner_address, nftoken_id, price_drop
     expiration_time = ripple_time + BUY_OFFER_EXPIRATION_SEC
     
     seq, ticket = await get_tx_sequence_and_ticket(client_obj)
-    tx = NFTokenCreateOffer(
-        account=wallet.classic_address,
-        nftoken_id=nftoken_id,
-        amount=str(bid_amount),
-        owner=owner_address,
-        expiration=expiration_time,
-        sequence=seq,
-        ticket_sequence=ticket,
-        fee=calculate_tx_fee()
-    )
-    
+    if seq is None and ticket is None:
+        print("[Error] Failed to acquire valid sequence or ticket for brokered buy.")
+        return False, 0
+
     if DRY_RUN:
         print(f"[DRY RUN] Would submit NFTokenCreateOffer Buy (Ticket: {ticket}) for NFT {nftoken_id} with amount {bid_amount} drops to owner {owner_address}")
         return True, bid_amount
     
     try:
+        tx = NFTokenCreateOffer(
+            account=wallet.classic_address,
+            nftoken_id=nftoken_id,
+            amount=str(bid_amount),
+            owner=owner_address,
+            expiration=expiration_time,
+            sequence=seq,
+            ticket_sequence=ticket,
+            fee=calculate_tx_fee()
+        )
         response = await submit_and_wait(tx, client_obj, wallet)
         if response.is_successful() and response.result.get("meta", {}).get("TransactionResult") == "tesSUCCESS":
             print(f"[Success] Created Buy Offer for NFT {nftoken_id}. Waiting for broker matching...")
@@ -539,21 +545,24 @@ async def create_sell_offer(client_obj, nftoken_id, price_drops):
     print(f"[Sell] Creating Sell Offer for NFT {nftoken_id} at {price_drops / 1_000_000} XRP...")
     
     seq, ticket = await get_tx_sequence_and_ticket(client_obj)
-    tx = NFTokenCreateOffer(
-        account=wallet.classic_address,
-        nftoken_id=nftoken_id,
-        amount=str(price_drops),
-        flags=NFTokenCreateOfferFlag.TF_SELL_NFTOKEN,
-        sequence=seq,
-        ticket_sequence=ticket,
-        fee=calculate_tx_fee()
-    )
-    
+    if seq is None and ticket is None:
+        print("[Error] Failed to acquire valid sequence or ticket for sell offer.")
+        return None
+
     if DRY_RUN:
         print(f"[DRY RUN] Would submit NFTokenCreateOffer Sell (Ticket: {ticket}) for NFT {nftoken_id} at {price_drops} drops")
         return "DRY_RUN_OFFER_ID"
     
     try:
+        tx = NFTokenCreateOffer(
+            account=wallet.classic_address,
+            nftoken_id=nftoken_id,
+            amount=str(price_drops),
+            flags=NFTokenCreateOfferFlag.TF_SELL_NFTOKEN,
+            sequence=seq,
+            ticket_sequence=ticket,
+            fee=calculate_tx_fee()
+        )
         response = await submit_and_wait(tx, client_obj, wallet)
         if response.is_successful() and response.result.get("meta", {}).get("TransactionResult") == "tesSUCCESS":
             affected_nodes = response.result.get("meta", {}).get("AffectedNodes", [])
@@ -581,19 +590,22 @@ async def cancel_sell_offer(client_obj, offer_id, nftoken_id):
     print(f"[Cancel] Canceling active sell offer {offer_id} for NFT {nftoken_id}...")
     
     seq, ticket = await get_tx_sequence_and_ticket(client_obj)
-    tx = NFTokenCancelOffer(
-        account=wallet.classic_address,
-        nftoken_offers=[offer_id],
-        sequence=seq,
-        ticket_sequence=ticket,
-        fee=calculate_tx_fee()
-    )
-    
+    if seq is None and ticket is None:
+        print("[Error] Failed to acquire valid sequence or ticket for cancelling sell offer.")
+        return False
+
     if DRY_RUN:
         print(f"[DRY RUN] Would submit NFTokenCancelOffer (Ticket: {ticket}) for Offer ID: {offer_id}")
         return True
     
     try:
+        tx = NFTokenCancelOffer(
+            account=wallet.classic_address,
+            nftoken_offers=[offer_id],
+            sequence=seq,
+            ticket_sequence=ticket,
+            fee=calculate_tx_fee()
+        )
         response = await submit_and_wait(tx, client_obj, wallet)
         if response.is_successful() and response.result.get("meta", {}).get("TransactionResult") == "tesSUCCESS":
             print(f"[Success] Cancelled sell offer {offer_id}.")
@@ -815,25 +827,28 @@ async def validate_and_cleanup_offers(client_obj, api_data):
     # Cancel all flagged offers
     if offers_to_cancel:
         seq, ticket = await get_tx_sequence_and_ticket(client_obj)
-        tx = NFTokenCancelOffer(
-            account=wallet.classic_address,
-            nftoken_offers=offers_to_cancel,
-            sequence=seq,
-            ticket_sequence=ticket,
-            fee=calculate_tx_fee()
-        )
-        if not DRY_RUN:
-            try:
-                response = await submit_and_wait(tx, client_obj, wallet)
-                if response.is_successful() and response.result.get("meta", {}).get("TransactionResult") == "tesSUCCESS":
-                    print(f"[Success] Successfully cancelled {len(offers_to_cancel)} invalid/duplicate offers on-ledger.")
-                else:
-                    res_code = response.result.get("meta", {}).get("TransactionResult", "Unknown")
-                    print(f"[Error] Failed to cancel invalid offers on-ledger. Result code: {res_code}")
-            except Exception as e:
-                print(f"[Error] Failed to submit cancel transaction: {e}")
+        if seq is None and ticket is None:
+            print("[Error] Failed to acquire valid sequence or ticket for invalid/duplicate offers cancellation.")
         else:
-            print(f"[DRY RUN] Would submit NFTokenCancelOffer (Ticket: {ticket}) to cancel: {offers_to_cancel}")
+            if not DRY_RUN:
+                try:
+                    tx = NFTokenCancelOffer(
+                        account=wallet.classic_address,
+                        nftoken_offers=offers_to_cancel,
+                        sequence=seq,
+                        ticket_sequence=ticket,
+                        fee=calculate_tx_fee()
+                    )
+                    response = await submit_and_wait(tx, client_obj, wallet)
+                    if response.is_successful() and response.result.get("meta", {}).get("TransactionResult") == "tesSUCCESS":
+                        print(f"[Success] Successfully cancelled {len(offers_to_cancel)} invalid/duplicate offers on-ledger.")
+                    else:
+                        res_code = response.result.get("meta", {}).get("TransactionResult", "Unknown")
+                        print(f"[Error] Failed to cancel invalid offers on-ledger. Result code: {res_code}")
+                except Exception as e:
+                    print(f"[Error] Failed to submit cancel transaction: {e}")
+            else:
+                print(f"[DRY RUN] Would submit NFTokenCancelOffer (Ticket: {ticket}) to cancel: {offers_to_cancel}")
             
     return objects
 
