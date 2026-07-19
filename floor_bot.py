@@ -121,6 +121,15 @@ if BOT_MODE == "COLLECT_PROFIT":
     print(f"Operating Buffer: {MIN_OPERATING_BUFFER_XRP} XRP")
     print(f"Min Sweep Trigger: {PROFIT_SWEEP_MIN_TRIGGER_XRP} XRP")
 
+# Startup validations
+if MAX_FEE_DROPS < BASE_FEE_DROPS:
+    print(f"[Warning] MAX_FEE_DROPS ({MAX_FEE_DROPS}) is less than BASE_FEE_DROPS ({BASE_FEE_DROPS}). Clamping MAX_FEE_DROPS to BASE_FEE_DROPS.")
+    MAX_FEE_DROPS = BASE_FEE_DROPS
+
+if COLLECTION_BID_ENABLED and COLLECTION_BID_XRP > TARGET_BUY_FLOOR_XRP:
+    print(f"[CRITICAL SAFETY WARNING] COLLECTION_BID_XRP ({COLLECTION_BID_XRP} XRP) exceeds TARGET_BUY_FLOOR_XRP ({TARGET_BUY_FLOOR_XRP} XRP). Disabling Collection Bidding for safety!")
+    COLLECTION_BID_ENABLED = False
+
 # Wallet Initialization
 seed = os.getenv("XRPL_SEED", "").strip()
 is_seed_configured = seed and seed != "sYOUR_SECRET_SEED_HERE"
@@ -575,18 +584,6 @@ async def cancel_sell_offer(client_obj, offer_id, nftoken_id):
         print(f"[Error] Transaction submission failed: {e}")
         return False
 
-async def check_owned_nfts_sell_offers(client_obj, nft_id):
-    """
-    Get all active sell offers on the ledger for an NFT.
-    """
-    try:
-        request = NFTSellOffers(nft_id=nft_id)
-        response = await client_obj.request(request)
-        if response.is_successful():
-            return response.result.get("offers", [])
-    except Exception as e:
-        pass
-    return []
 
 async def validate_and_cleanup_offers(client_obj, api_data):
     """
@@ -994,8 +991,14 @@ async def manage_inventory(client_obj, http_client, active_offers):
         if AVAILABLE_TICKETS:
             print(f"[Inventory] Tickets are active ({len(AVAILABLE_TICKETS)} available). Creating {len(unlisted_nfts)} sell listings concurrently...")
             tasks = []
+            tx_fee = int(calculate_tx_fee())
             for nft in unlisted_nfts:
-                tasks.append(process_single_nft_inventory(client_obj, http_client, nft, our_sell_offers, local_free_bal))
+                # Deduct reserve prospectively to prevent concurrent tasks from checking stale balance
+                if local_free_bal >= (200_000 + tx_fee):
+                    tasks.append(process_single_nft_inventory(client_obj, http_client, nft, our_sell_offers, local_free_bal))
+                    local_free_bal -= (200_000 + tx_fee)
+                else:
+                    print(f"[Inventory] Insufficient reserve to list NFT {nft.get('NFTokenID')}. Skipping.")
             await asyncio.gather(*tasks)
             local_free_bal = await get_free_balance(client_obj)
         else:
@@ -1322,28 +1325,27 @@ async def manage_collection_bids(client_obj, http_client):
 
     if obsolete_bids:
         cancels_to_run = obsolete_bids[:10]
-        print(f"[Collection Bids] Found {len(obsolete_bids)} obsolete buy offers. Cancelling {len(cancels_to_run)} concurrently in this cycle...")
+        print(f"[Collection Bids] Found {len(obsolete_bids)} obsolete buy offers. Cancelling {len(cancels_to_run)} in a single transaction in this cycle...")
         
-        async def cancel_one_bid(offer_index, nft_id, reason):
-            seq, ticket = await get_tx_sequence_and_ticket(client_obj)
-            tx_fee = calculate_tx_fee()
-            tx = NFTokenCancelOffer(
-                account=wallet.classic_address,
-                nftoken_offers=[offer_index],
-                sequence=seq,
-                ticket_sequence=ticket,
-                fee=tx_fee
-            )
-            if not DRY_RUN:
-                resp = await submit_and_wait(tx, client_obj, wallet)
-                if resp.is_successful():
+        offer_indexes = [idx for idx, _, _ in cancels_to_run]
+        seq, ticket = await get_tx_sequence_and_ticket(client_obj)
+        tx_fee = calculate_tx_fee()
+        tx = NFTokenCancelOffer(
+            account=wallet.classic_address,
+            nftoken_offers=offer_indexes,
+            sequence=seq,
+            ticket_sequence=ticket,
+            fee=tx_fee
+        )
+        if not DRY_RUN:
+            resp = await submit_and_wait(tx, client_obj, wallet)
+            if resp.is_successful():
+                for _, nft_id, reason in cancels_to_run:
                     print(f"[Collection Bids Success] Cancelled obsolete bid on {nft_id} (Reason: {reason})")
-                else:
-                    print(f"[Collection Bids Error] Failed to cancel bid on {nft_id}: {resp.result}")
             else:
-                print(f"[DRY RUN] Would cancel obsolete bid on {nft_id} (Ticket: {ticket}, Reason: {reason})")
-
-        await asyncio.gather(*(cancel_one_bid(idx, nft_id, reason) for idx, nft_id, reason in cancels_to_run))
+                print(f"[Collection Bids Error] Failed to cancel obsolete bids: {resp.result}")
+        else:
+            print(f"[DRY RUN] Would cancel {len(cancels_to_run)} obsolete bids (Ticket: {ticket})")
         return # Skip bidding until cleanup is done in this ledger cycle
 
     # Step 3: Placing New Bids (Max 10 per cycle)
@@ -1358,6 +1360,21 @@ async def manage_collection_bids(client_obj, http_client):
     
     if free_xrp < min_xrp_needed:
         print(f"[Collection Bids Warning] Insufficient free balance to place new collection bids: {free_xrp:.2f} XRP free vs {min_xrp_needed:.2f} XRP needed.")
+        return
+
+    tx_fee = int(calculate_tx_fee())
+    # Reserve buffer requirement: 15.0 XRP + 2 accepted bids
+    reserve_buffer_drops = 15_000_000 + (2 * COLLECTION_BID_DROPS)
+    spendable_drops = free_drops - reserve_buffer_drops
+    
+    if spendable_drops <= 0:
+        print(f"[Collection Bids Warning] Spendable balance is too low to place bids (must retain {reserve_buffer_drops/1_000_000:.2f} XRP buffer). Skipping.")
+        return
+        
+    # Calculate how many bids we can support in this cycle (0.2 XRP reserve + fee per bid)
+    max_bids_supported = int(spendable_drops / (200_000 + tx_fee))
+    if max_bids_supported <= 0:
+        print(f"[Collection Bids Warning] Remaining spendable balance cannot support any new bid reserves. Skipping.")
         return
 
     # Fetch entire collection from xrpldata API
@@ -1380,12 +1397,12 @@ async def manage_collection_bids(client_obj, http_client):
     if not missing_bids:
         return
 
-    bids_to_run = missing_bids[:10]
-    print(f"[Collection Bids] Found {len(missing_bids)} NFTs lacking buy offers. Placing {len(bids_to_run)} concurrent bids at {COLLECTION_BID_XRP} XRP in this cycle...")
-
+    bids_limit = min(10, max_bids_supported)
+    bids_to_run = missing_bids[:bids_limit]
+    
     async def place_one_bid(nft_id, owner_address):
         seq, ticket = await get_tx_sequence_and_ticket(client_obj)
-        tx_fee = calculate_tx_fee()
+        tx_fee_val = calculate_tx_fee()
         tx = NFTokenCreateOffer(
             account=wallet.classic_address,
             owner=owner_address,
@@ -1393,7 +1410,7 @@ async def manage_collection_bids(client_obj, http_client):
             amount=str(COLLECTION_BID_DROPS),
             sequence=seq,
             ticket_sequence=ticket,
-            fee=tx_fee
+            fee=tx_fee_val
         )
         if not DRY_RUN:
             resp = await submit_and_wait(tx, client_obj, wallet)
@@ -1404,7 +1421,13 @@ async def manage_collection_bids(client_obj, http_client):
         else:
             print(f"[DRY RUN] Would place {COLLECTION_BID_XRP} XRP buy offer on {nft_id} (Ticket: {ticket})")
 
-    await asyncio.gather(*(place_one_bid(nft_id, owner) for nft_id, owner in bids_to_run))
+    if AVAILABLE_TICKETS:
+        print(f"[Collection Bids] Found {len(missing_bids)} NFTs lacking buy offers. Placing {len(bids_to_run)} concurrent bids at {COLLECTION_BID_XRP} XRP in this cycle...")
+        await asyncio.gather(*(place_one_bid(nft_id, owner) for nft_id, owner in bids_to_run))
+    else:
+        print(f"[Collection Bids] Found {len(missing_bids)} NFTs lacking buy offers. No active tickets. Placing {len(bids_to_run)} bids sequentially...")
+        for nft_id, owner in bids_to_run:
+            await place_one_bid(nft_id, owner)
 
 async def async_main():
     """
