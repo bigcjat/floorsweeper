@@ -56,6 +56,9 @@ MAX_ACTIVE_BUYS = int(os.getenv("MAX_ACTIVE_BUYS", "4"))
 BUY_OFFER_EXPIRATION_SEC = int(os.getenv("BUY_OFFER_EXPIRATION_SEC", "600"))
 RELIST_MARKUP_DIVISOR = float(os.getenv("RELIST_MARKUP_DIVISOR", "0.9"))
 AUTO_RELIST = os.getenv("AUTO_RELIST", "True").lower() == "true"
+COLLECTION_BID_ENABLED = os.getenv("COLLECTION_BID_ENABLED", "False").lower() == "true"
+COLLECTION_BID_XRP = float(os.getenv("COLLECTION_BID_XRP", "0.0"))
+COLLECTION_BID_DROPS = int(COLLECTION_BID_XRP * 1_000_000)
 
 # Operational Modes & Profit Collector Configuration
 BOT_MODE = os.getenv("BOT_MODE", "REINVEST").strip().upper()
@@ -102,6 +105,7 @@ print(f"Brokers:       {json.dumps(BROKERS)}")
 print(f"Max Active Buys:{MAX_ACTIVE_BUYS}")
 print(f"Buy Expiration:{BUY_OFFER_EXPIRATION_SEC} seconds")
 print(f"Auto Relist:   {AUTO_RELIST}")
+print(f"Collection Bid:{COLLECTION_BID_XRP} XRP (Enabled: {COLLECTION_BID_ENABLED})")
 print(f"Priority Buys: {len(PRIORITY_BUY_IDS)} items configured")
 print(f"Hold (No-Sell):{len(HOLD_IDS)} items configured")
 print(f"Relist Divisor:{RELIST_MARKUP_DIVISOR}")
@@ -306,6 +310,24 @@ async def fetch_api_sell_offers(http_client):
     except Exception as e:
         print(f"[API Error] Failed to fetch collection offers: {e}")
         return None
+
+async def fetch_api_collection_nfts(http_client):
+    """
+    Fetch all NFTs in the collection from xrpldata.com.
+    """
+    url = f"https://api.xrpldata.com/api/v1/xls20-nfts/issuer/{ISSUER}/taxon/{TAXON}"
+    headers = {}
+    if XRP_API_KEY:
+        headers["x-api-key"] = XRP_API_KEY
+    
+    try:
+        response = await http_client.get(url, headers=headers, timeout=25)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("data", {}).get("nfts", [])
+    except Exception as e:
+        print(f"[API Error] Failed to fetch collection NFTs: {e}")
+        return []
 
 async def get_free_balance(client_obj):
     """
@@ -1007,7 +1029,7 @@ async def scan_and_sweep(client_obj, http_client, api_data=None, collection_nfts
         return
     
     offers_list = api_data["data"]["offers"]
-    print(f"[Scan] Scanned {len(offers_list)} NFTs in the collection.")
+    print(f"[Scan] Scanned {len(offers_list)} active market listings (sell offers) in the collection.")
     
     # Query open Buy Offers on-ledger ONCE at start of cycle
     active_bids_nft_ids = set()
@@ -1216,6 +1238,174 @@ async def manage_profits(client_obj):
     except Exception as e:
         print(f"[Profit Collector Error] Exception occurred during profit sweeping: {e}")
 
+async def manage_collection_bids(client_obj, http_client):
+    """
+    Manage automated collection-wide low-ball buy offers (bids).
+    Automatically places bids up to 10 per ledger, and cleans up obsolete ones.
+    """
+    try:
+        # Step 1: Scan active buy offers created by our wallet from ledger
+        from xrpl.models.requests import AccountObjects
+        from xrpl.models.requests import AccountObjectType
+        
+        our_buy_offers = {}
+        marker = None
+        while True:
+            req = AccountObjects(
+                account=wallet.classic_address,
+                type=AccountObjectType.NFT_OFFER,
+                marker=marker
+            )
+            res = await client_obj.request(req)
+            if not res.is_successful():
+                break
+            objects = res.result.get("account_objects", [])
+            for obj in objects:
+                # Check if it is a BUY offer (Flags & 1 is 0 for buy offer, 1 for sell offer)
+                flags = obj.get("Flags", 0)
+                is_sell = flags & 1
+                if not is_sell:
+                    nft_id = obj.get("NFTokenID")
+                    our_buy_offers[nft_id] = obj
+            marker = res.result.get("marker")
+            if not marker:
+                break
+    except Exception as e:
+        print(f"[Collection Bids Error] Failed to scan active buy offers: {e}")
+        return
+
+    # Scan currently owned collection NFTs
+    owned_nfts = []
+    marker = None
+    try:
+        while True:
+            req = AccountNFTs(account=wallet.classic_address, marker=marker)
+            res = await client_obj.request(req)
+            if res.is_successful():
+                owned_nfts.extend(res.result.get("account_nfts", []))
+                marker = res.result.get("marker")
+                if not marker:
+                    break
+            else:
+                break
+    except Exception as e:
+        print(f"[Collection Bids Error] Failed to scan owned NFTs: {e}")
+        return
+    
+    # Owned NFTokenIDs in the target collection
+    owned_nft_ids = {n.get("NFTokenID") for n in owned_nfts if n.get("Issuer") == ISSUER and n.get("NFTokenTaxon") == TAXON}
+
+    # Step 2: Obsolete Bids Cleanup (Max 10 cancels per cycle)
+    # An active buy offer is obsolete if:
+    # A. COLLECTION_BID_ENABLED is False
+    # B. The offer's price does not match COLLECTION_BID_XRP
+    # C. We now own the NFT (NFTokenID in owned_nft_ids)
+    obsolete_bids = []
+    for nft_id, offer in list(our_buy_offers.items()):
+        # Extract offer amount in drops
+        offer_amount = int(offer.get("Amount", 0))
+        obsolete = False
+        reason = ""
+        
+        if not COLLECTION_BID_ENABLED:
+            obsolete = True
+            reason = "Collection bidding disabled"
+        elif offer_amount != COLLECTION_BID_DROPS:
+            obsolete = True
+            reason = f"Bid price mismatch (active {offer_amount/1_000_000} XRP vs target {COLLECTION_BID_XRP} XRP)"
+        elif nft_id in owned_nft_ids:
+            obsolete = True
+            reason = "NFT is now owned by us"
+            
+        if obsolete:
+            obsolete_bids.append((offer.get("index"), nft_id, reason))
+
+    if obsolete_bids:
+        cancels_to_run = obsolete_bids[:10]
+        print(f"[Collection Bids] Found {len(obsolete_bids)} obsolete buy offers. Cancelling {len(cancels_to_run)} concurrently in this cycle...")
+        
+        async def cancel_one_bid(offer_index, nft_id, reason):
+            seq, ticket = await get_tx_sequence_and_ticket(client_obj)
+            tx_fee = calculate_tx_fee()
+            tx = NFTokenCancelOffer(
+                account=wallet.classic_address,
+                nftoken_offers=[offer_index],
+                sequence=seq,
+                ticket_sequence=ticket,
+                fee=tx_fee
+            )
+            if not DRY_RUN:
+                resp = await submit_and_wait(tx, client_obj, wallet)
+                if resp.is_successful():
+                    print(f"[Collection Bids Success] Cancelled obsolete bid on {nft_id} (Reason: {reason})")
+                else:
+                    print(f"[Collection Bids Error] Failed to cancel bid on {nft_id}: {resp.result}")
+            else:
+                print(f"[DRY RUN] Would cancel obsolete bid on {nft_id} (Ticket: {ticket}, Reason: {reason})")
+
+        await asyncio.gather(*(cancel_one_bid(idx, nft_id, reason) for idx, nft_id, reason in cancels_to_run))
+        return # Skip bidding until cleanup is done in this ledger cycle
+
+    # Step 3: Placing New Bids (Max 10 per cycle)
+    if not COLLECTION_BID_ENABLED:
+        return
+
+    # Balance Validation:
+    # Need base reserve (10 XRP) + ticket/gas buffer (5 XRP) + 2 accepted bids
+    min_xrp_needed = 10.0 + 5.0 + (2.0 * COLLECTION_BID_XRP)
+    free_drops = await get_free_balance(client_obj)
+    free_xrp = free_drops / 1_000_000
+    
+    if free_xrp < min_xrp_needed:
+        print(f"[Collection Bids Warning] Insufficient free balance to place new collection bids: {free_xrp:.2f} XRP free vs {min_xrp_needed:.2f} XRP needed.")
+        return
+
+    # Fetch entire collection from xrpldata API
+    collection_nfts = await fetch_api_collection_nfts(http_client)
+    if not collection_nfts:
+        print("[Collection Bids] No NFTs returned from collection API. Skipping bidding.")
+        return
+
+    # Identify missing bids
+    missing_bids = []
+    for nft in collection_nfts:
+        nft_id = nft.get("NFTokenID")
+        owner = nft.get("Owner")
+        
+        # Must not be owned by us, must not already have our buy offer
+        if owner != wallet.classic_address and nft_id not in owned_nft_ids and nft_id not in our_buy_offers:
+            if nft.get("Issuer") == ISSUER:
+                missing_bids.append((nft_id, owner))
+
+    if not missing_bids:
+        return
+
+    bids_to_run = missing_bids[:10]
+    print(f"[Collection Bids] Found {len(missing_bids)} NFTs lacking buy offers. Placing {len(bids_to_run)} concurrent bids at {COLLECTION_BID_XRP} XRP in this cycle...")
+
+    async def place_one_bid(nft_id, owner_address):
+        seq, ticket = await get_tx_sequence_and_ticket(client_obj)
+        tx_fee = calculate_tx_fee()
+        tx = NFTokenCreateOffer(
+            account=wallet.classic_address,
+            owner=owner_address,
+            nftoken_id=nft_id,
+            amount=str(COLLECTION_BID_DROPS),
+            sequence=seq,
+            ticket_sequence=ticket,
+            fee=tx_fee
+        )
+        if not DRY_RUN:
+            resp = await submit_and_wait(tx, client_obj, wallet)
+            if resp.is_successful():
+                print(f"[Collection Bids Success] Placed {COLLECTION_BID_XRP} XRP buy offer on {nft_id}")
+            else:
+                print(f"[Collection Bids Error] Failed to place buy offer on {nft_id}: {resp.result}")
+        else:
+            print(f"[DRY RUN] Would place {COLLECTION_BID_XRP} XRP buy offer on {nft_id} (Ticket: {ticket})")
+
+    await asyncio.gather(*(place_one_bid(nft_id, owner) for nft_id, owner in bids_to_run))
+
 async def async_main():
     """
     Main asynchronous loop of the bot.
@@ -1264,6 +1454,9 @@ async def async_main():
                             
                             # Step 5: Scan collection for deals and buy them
                             await scan_and_sweep(client_obj, http_client, api_data, collection_nfts, our_sell_offers)
+                            
+                            # Step 5b: Manage collection-wide low-ball buy bids
+                            await manage_collection_bids(client_obj, http_client)
                             
                             # Step 6: Sweep surplus profits to cold wallet if configured
                             await manage_profits(client_obj)
