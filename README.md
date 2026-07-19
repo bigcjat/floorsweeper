@@ -3,7 +3,7 @@
 * 📉 **Floor Sweeper:** Automatically scans the market and sweeps listings listed below your target price ceiling (supports public sell offers and direct snipes).
 * 📈 **Smart Relisting:** Auto-relists bought tokens at your floor margin, dynamically calculating creator royalties and marketplace broker fees so you never list at a loss.
 * 💰 **Profit Collector:** Optional profit mode caps your hot wallet inventory and automatically routes surplus XRP to a secure cold wallet using payments or cashing checks.
-* 🎯 **Priority Snipping:** Prioritizes sniping specific target `NFTokenID`s immediately if they land on the market below your ceiling price.
+* 🎯 **Priority Sniping:** Prioritizes sniping specific target `NFTokenID`s immediately if they land on the market below your ceiling price.
 * 🔒 **Hold-List Protection:** Protects a customizable list of `NFTokenID`s, preventing the bot from ever automatically selling them or cancelling buy offers placed on them.
 * 📊 **Collection Bids:** Automatically places standing low-ball buy offers on the entire target collection, featuring automatic owner transition tracking, redundant bid cleanups, and balance validations.
 * 🧪 **Dry-Run Simulation:** Allows you to run full loop cycles in simulation mode, verifying and logging exact ledger actions without submitting transactions or spending real XRP.
