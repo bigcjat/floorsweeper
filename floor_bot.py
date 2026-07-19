@@ -764,6 +764,9 @@ async def validate_and_cleanup_offers(client_obj, api_data):
                     nft_to_sell_offers.setdefault(nft_id, []).append(obj)
         else:
             # Buy offer check
+            if nft_id in HOLD_IDS:
+                continue
+                
             if nft_id in owned_ids:
                 print(f"[Validation] Found buy offer for NFT {nft_id} that we already own. Scheduling cancel.")
                 offers_to_cancel.append(offer_index)
@@ -773,10 +776,6 @@ async def validate_and_cleanup_offers(client_obj, api_data):
             if not listing:
                 print(f"[Validation] Found buy offer for NFT {nft_id} but it is no longer listed for sale. Scheduling cancel.")
                 offers_to_cancel.append(offer_index)
-                continue
-                
-            # Skip price check for hold list NFTs to keep our manual/custom bids active
-            if nft_id in HOLD_IDS:
                 continue
                 
             # Check price/amount
@@ -1332,6 +1331,9 @@ async def manage_collection_bids(client_obj, http_client):
     # C. We now own the NFT (NFTokenID in owned_nft_ids)
     obsolete_bids = []
     for nft_id, offer in list(our_buy_offers.items()):
+        if nft_id in HOLD_IDS:
+            continue
+            
         # Extract offer amount in drops
         offer_amount = int(offer.get("Amount", 0))
         obsolete = False
