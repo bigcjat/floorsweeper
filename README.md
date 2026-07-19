@@ -10,10 +10,10 @@ This automated bot runs in the background to monitor a specific XLS-20 NFT colle
 
 ## Key Performance & Architecture Features
 
-* **Fully Asynchronous Execution**: Built using `asyncio` and `httpx` to execute network operations in parallel, drastically reducing execution latency.
-* **Multi-Sweep & Concurrency**: Sweeps and lists multiple NFTs in parallel by utilizing XRPL **Tickets**. This allows the bot to process transactions simultaneously without sequence collisions.
+* **Persistent WebSocket Connection**: Communicates with the XRPL Clio node over a persistent WebSocket connection (`wss://`), bypassing the TLS/TCP handshake overhead of JSON-RPC HTTP POST requests and handling automatic connection loss recovery.
+* **Concurrent Sweeps & Relistings**: Both purchasing cheap sweep candidates and creating new sell listings are executed concurrently in parallel using XRPL **Tickets**. This is protected by an asynchronous lock (`TICKET_LOCK`) to prevent ticket sequence race conditions.
 * **Auto-Replenishing Ticket Engine**: Monitors your wallet's ticket count. When active tickets drop below 5, it submits a batched `TicketCreate` transaction to top the pool back up to 30. Safely falls back to standard sequential account sequence numbers if tickets cannot be created.
-* **Startup Transaction Cost Cache**: Scans your account's historical transactions once on startup to build an in-memory cache of purchase costs. This completely eliminates public node rate-limiting (`503 Service Unavailable`) on `nft_history` and reduces cycle validation to under a second.
+* **Targeted Startup Cost Cache**: Queries Clio's `nft_history` endpoint concurrently for only the NFTs currently held in the wallet, avoiding the heavy page-by-page transaction history retrieval (`AccountTx`) and completing startup caching in under 5 seconds.
 * **Dynamic Royalty Protection**: Dynamically extracts the NFT's creator royalty (`TransferFee`) directly from characters 4 to 7 of the `NFTokenID` hex string. Automatically increases the listing price so you receive exactly your target net profit margin after royalties and broker fees are paid.
 * **Continuous Auto-Alignment**: Continuously validates active on-ledger listings. If you change target floor settings or the markup divisor in `.env`, the bot will automatically cancel and relist out-of-sync listings on the next cycle.
 * **Dynamic Fee Bounding**: Dynamically queries ledger transaction fees once per cycle to automatically scale transaction fees safely during network congestion.

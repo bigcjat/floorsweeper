@@ -7,9 +7,9 @@ import httpx
 from dotenv import load_dotenv
 
 # XRPL SDK imports
-from xrpl.asyncio.clients import AsyncJsonRpcClient
+from xrpl.asyncio.clients import AsyncJsonRpcClient, AsyncWebsocketClient
 from xrpl.wallet import Wallet
-from xrpl.models.requests import AccountNFTs, NFTSellOffers, AccountObjects, Fee, AccountObjectType
+from xrpl.models.requests import AccountNFTs, NFTSellOffers, AccountObjects, Fee, AccountObjectType, NFTHistory
 from xrpl.models.transactions import (
     NFTokenAcceptOffer,
     NFTokenCreateOffer,
@@ -87,6 +87,7 @@ TARGET_SELL_FLOOR_DROPS = int(TARGET_SELL_FLOOR_XRP * 1_000_000)
 
 # Ticket queue state
 AVAILABLE_TICKETS = []
+TICKET_LOCK = asyncio.Lock()
 PURCHASE_COST_CACHE = {}
 
 print("=" * 80)
@@ -247,20 +248,21 @@ async def get_tx_sequence_and_ticket(client_obj):
     Get the next sequence or ticket sequence to use for a transaction.
     Returns (sequence, ticket_sequence) tuple.
     """
-    ticket = await get_next_ticket(client_obj)
-    if ticket is not None:
-        return 0, ticket
-        
-    # Fallback to standard sequence
-    from xrpl.models.requests import AccountInfo
-    try:
-        resp = await client_obj.request(AccountInfo(account=wallet.classic_address))
-        if resp.is_successful():
-            seq = resp.result.get("account_data", {}).get("Sequence")
-            return seq, None
-    except Exception as e:
-        print(f"[Warning] Failed to fetch standard sequence: {e}")
-    return None, None
+    async with TICKET_LOCK:
+        ticket = await get_next_ticket(client_obj)
+        if ticket is not None:
+            return 0, ticket
+            
+        # Fallback to standard sequence
+        from xrpl.models.requests import AccountInfo
+        try:
+            resp = await client_obj.request(AccountInfo(account=wallet.classic_address))
+            if resp.is_successful():
+                seq = resp.result.get("account_data", {}).get("Sequence")
+                return seq, None
+        except Exception as e:
+            print(f"[Warning] Failed to fetch standard sequence: {e}")
+        return None, None
 
 CURRENT_TX_FEE_DROPS = str(BASE_FEE_DROPS)
 
@@ -351,63 +353,49 @@ def calculate_relist_price(nft_id, cost_drops):
 
 async def populate_purchase_cost_cache(client_obj):
     """
-    Fetch the account's transaction history on startup and trace purchase costs
-    for currently owned NFTs, storing them in the global PURCHASE_COST_CACHE.
+    Fetch purchase costs for currently owned collection NFTs by querying their
+    ledger histories concurrently, storing them in the global PURCHASE_COST_CACHE.
     """
     global PURCHASE_COST_CACHE
-    print("[Cost Cache] Initializing purchase cost cache from ledger history...")
-    all_txs = []
+    print("[Cost Cache] Initializing purchase cost cache using targeted nft_history queries...")
+    
+    # 1. Fetch owned NFTs from target collection
+    owned_nfts = []
     marker = None
     try:
         while True:
-            from xrpl.models.requests import AccountTx
-            req = AccountTx(account=wallet.classic_address, marker=marker)
-            res = await client_obj.request(req)
-            if not res.is_successful():
-                print(f"[Cost Cache Warning] Failed to fetch transactions: {res.result}")
-                break
-            all_txs.extend(res.result.get("transactions", []))
-            marker = res.result.get("marker")
-            if not marker:
+            request = AccountNFTs(account=wallet.classic_address, marker=marker)
+            response = await client_obj.request(request)
+            if response.is_successful():
+                owned_nfts.extend(response.result.get("account_nfts", []))
+                marker = response.result.get("marker")
+                if not marker:
+                    break
+            else:
                 break
     except Exception as e:
-        print(f"[Cost Cache Warning] Exception querying history: {e}")
+        print(f"[Cost Cache Warning] Failed to query owned target NFTs: {e}")
         return
 
-    # Build cost mapping (newest transaction first, so we only store the newest buy price)
-    for tx_wrapper in all_txs:
-        tx = tx_wrapper.get("tx_json", tx_wrapper.get("tx", {}))
-        meta = tx_wrapper.get("meta", {})
-        
-        if meta.get("TransactionResult") == "tesSUCCESS":
-            tx_type = tx.get("TransactionType")
-            account = tx.get("Account", "")
-            
-            # Case A: We accepted a sell offer (bought or transferred)
-            if tx_type == "NFTokenAcceptOffer" and account == wallet.classic_address:
-                for node in meta.get("AffectedNodes", []):
-                    deleted = node.get("DeletedNode", {})
-                    if deleted.get("LedgerEntryType") == "NFTokenOffer":
-                        fields = deleted.get("FinalFields", {})
-                        nft_id = fields.get("NFTokenID")
-                        if nft_id and nft_id not in PURCHASE_COST_CACHE:
-                            owner = fields.get("Owner", "")
-                            amount_val = fields.get("Amount", "0")
-                            if owner.lower().startswith("rkinwuk"):
-                                PURCHASE_COST_CACHE[nft_id] = 5_000_000 # 5 XRP
-                            else:
-                                PURCHASE_COST_CACHE[nft_id] = int(amount_val)
+    collection_nfts = [n for n in owned_nfts if n.get("Issuer") == ISSUER and n.get("NFTokenTaxon") == TAXON]
+    if not collection_nfts:
+        print("[Cost Cache] No owned target NFTs in wallet. Cache initialized empty.")
+        return
 
-            # Case B: Someone accepted our buy offer (we bought)
-            if tx_type == "NFTokenAcceptOffer":
-                for node in meta.get("AffectedNodes", []):
-                    deleted = node.get("DeletedNode", {})
-                    if deleted.get("LedgerEntryType") == "NFTokenOffer":
-                        fields = deleted.get("FinalFields", {})
-                        nft_id = fields.get("NFTokenID")
-                        if nft_id and nft_id not in PURCHASE_COST_CACHE and fields.get("Owner") == wallet.classic_address and not (fields.get("Flags", 0) & 1):
-                            amount_val = fields.get("Amount", "0")
-                            PURCHASE_COST_CACHE[nft_id] = int(amount_val)
+    print(f"[Cost Cache] Found {len(collection_nfts)} owned target NFTs. Querying ledger histories concurrently...")
+
+    async with httpx.AsyncClient() as http_client:
+        async def fetch_cost(nft):
+            nft_id = nft.get("NFTokenID")
+            try:
+                cost = await get_purchase_price_from_ledger(client_obj, http_client, nft_id)
+                PURCHASE_COST_CACHE[nft_id] = cost
+            except Exception:
+                # Default to 5.0 XRP if history cannot be resolved
+                PURCHASE_COST_CACHE[nft_id] = 5_000_000
+
+        # Query history for all owned target NFTs in parallel
+        await asyncio.gather(*(fetch_cost(nft) for nft in collection_nfts))
 
     print(f"[Cost Cache] Initialized cache with {len(PURCHASE_COST_CACHE)} known NFT purchase costs.")
 
@@ -818,21 +806,28 @@ async def get_purchase_price_from_ledger(client_obj, http_client, nft_id):
         return PURCHASE_COST_CACHE[nft_id]
 
     try:
-        # Submit raw JSON-RPC request to XRPL_NODE for nft_history
-        payload = {
-            "method": "nft_history",
-            "params": [
-                {
-                    "nft_id": nft_id
-                }
-            ]
-        }
-        res = await http_client.post(client_obj.url, json=payload, timeout=15)
-        res.raise_for_status()
-        data = res.json()
-        
-        result = data.get("result", {})
-        transactions = result.get("transactions", [])
+        if isinstance(client_obj, AsyncWebsocketClient):
+            req = NFTHistory(nft_id=nft_id)
+            response = await client_obj.request(req)
+            if not response.is_successful():
+                raise ValueError(f"WebSocket request failed: {response.result}")
+            result = response.result
+            transactions = result.get("transactions", [])
+        else:
+            # Submit raw JSON-RPC request to XRPL_NODE for nft_history
+            payload = {
+                "method": "nft_history",
+                "params": [
+                    {
+                        "nft_id": nft_id
+                    }
+                ]
+            }
+            res = await http_client.post(client_obj.url, json=payload, timeout=15)
+            res.raise_for_status()
+            data = res.json()
+            result = data.get("result", {})
+            transactions = result.get("transactions", [])
         
         for tx_wrapper in transactions:
             tx = tx_wrapper.get("tx", {})
@@ -958,11 +953,33 @@ async def manage_inventory(client_obj, http_client, active_offers):
                     "owner": wallet.classic_address
                 }
     
+    # Top up ticket pool if needed before checking how to process
+    await ensure_ticket_pool(client_obj)
+
     local_free_bal = await get_free_balance(client_obj)
-    
-    # Process listing transactions sequentially to prevent Ticket Sequence race conditions
+
+    # Identify which NFTs need listing
+    unlisted_nfts = []
     for nft in collection_nfts:
-        local_free_bal = await process_single_nft_inventory(client_obj, http_client, nft, our_sell_offers, local_free_bal)
+        nft_id = nft.get("NFTokenID")
+        if nft_id in HOLD_IDS:
+            continue
+        if nft_id in our_sell_offers:
+            continue
+        unlisted_nfts.append(nft)
+
+    if unlisted_nfts:
+        if AVAILABLE_TICKETS:
+            print(f"[Inventory] Tickets are active ({len(AVAILABLE_TICKETS)} available). Creating {len(unlisted_nfts)} sell listings concurrently...")
+            tasks = []
+            for nft in unlisted_nfts:
+                tasks.append(process_single_nft_inventory(client_obj, http_client, nft, our_sell_offers, local_free_bal))
+            await asyncio.gather(*tasks)
+            local_free_bal = await get_free_balance(client_obj)
+        else:
+            print("[Inventory] No active tickets. Creating sell listings sequentially...")
+            for nft in unlisted_nfts:
+                local_free_bal = await process_single_nft_inventory(client_obj, http_client, nft, our_sell_offers, local_free_bal)
 
     return collection_nfts, our_sell_offers
 
@@ -1203,59 +1220,69 @@ async def async_main():
     """
     Main asynchronous loop of the bot.
     """
-    # Establish XRPL client
-    try:
-        client_obj = AsyncJsonRpcClient(XRPL_NODE)
-        print("Connected to XRPL Node.")
-    except Exception as e:
-        print(f"[CRITICAL ERROR] Failed to connect to XRPL node {XRPL_NODE}: {e}")
-        sys.exit(1)
+    ws_url = XRPL_NODE.replace("https://", "wss://").replace("http://", "ws://")
+    if ":51234" in ws_url:
+        ws_url = ws_url.replace(":51234", ":51233")
 
-    # Populate the global purchase cost cache on startup
-    await populate_purchase_cost_cache(client_obj)
+    cache_initialized = False
 
-    async with httpx.AsyncClient() as http_client:
-        while True:
-            try:
-                print("\n" + "-" * 50)
-                print(f"Starting Bot Cycle at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                print("-" * 50)
+    while True:
+        try:
+            print(f"Connecting to XRPL Node (WebSocket): {ws_url}")
+            async with AsyncWebsocketClient(ws_url) as client_obj:
+                print("Connected to XRPL Node.")
                 
-                # Step 0: Update cached transaction fee for this cycle
-                await update_current_fee(client_obj)
-                
-                # Step 1: Ensure ticket pool is loaded/topped up on-ledger
-                await ensure_ticket_pool(client_obj)
-                
-                # Step 2: Fetch API offers once for the cycle
-                api_data = await fetch_api_sell_offers(http_client)
-                
-                # Step 3: Validate all open buy and sell offers, canceling obsolete ones
-                active_offers = await validate_and_cleanup_offers(client_obj, api_data)
-                
-                # Step 4: Manage inventory and relist at correct floor
-                collection_nfts = []
-                our_sell_offers = {}
-                if AUTO_RELIST:
-                    collection_nfts, our_sell_offers = await manage_inventory(client_obj, http_client, active_offers)
-                
-                # Step 5: Scan collection for deals and buy them
-                await scan_and_sweep(client_obj, http_client, api_data, collection_nfts, our_sell_offers)
-                
-                # Step 6: Sweep surplus profits to cold wallet if configured
-                await manage_profits(client_obj)
-                
-                print(f"\nCycle complete. Waiting {POLL_INTERVAL} seconds...")
-            except KeyboardInterrupt:
-                print("\nShutting down bot.")
-                sys.exit(0)
-            except Exception as e:
-                print(f"[Main Error] Unexpected error in main loop: {e}")
-                import traceback
-                traceback.print_exc()
-                print("Retrying next cycle...")
-                
-            await asyncio.sleep(POLL_INTERVAL)
+                if not cache_initialized:
+                    # Populate the global purchase cost cache on startup
+                    await populate_purchase_cost_cache(client_obj)
+                    cache_initialized = True
+
+                async with httpx.AsyncClient() as http_client:
+                    while True:
+                        try:
+                            print("\n" + "-" * 50)
+                            print(f"Starting Bot Cycle at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                            print("-" * 50)
+                            
+                            # Step 0: Update cached transaction fee for this cycle
+                            await update_current_fee(client_obj)
+                            
+                            # Step 1: Ensure ticket pool is loaded/topped up on-ledger
+                            await ensure_ticket_pool(client_obj)
+                            
+                            # Step 2: Fetch API offers once for the cycle
+                            api_data = await fetch_api_sell_offers(http_client)
+                            
+                            # Step 3: Validate all open buy and sell offers, canceling obsolete ones
+                            active_offers = await validate_and_cleanup_offers(client_obj, api_data)
+                            
+                            # Step 4: Manage inventory and relist at correct floor
+                            collection_nfts = []
+                            our_sell_offers = {}
+                            if AUTO_RELIST:
+                                collection_nfts, our_sell_offers = await manage_inventory(client_obj, http_client, active_offers)
+                            
+                            # Step 5: Scan collection for deals and buy them
+                            await scan_and_sweep(client_obj, http_client, api_data, collection_nfts, our_sell_offers)
+                            
+                            # Step 6: Sweep surplus profits to cold wallet if configured
+                            await manage_profits(client_obj)
+                            
+                            print(f"\nCycle complete. Waiting {POLL_INTERVAL} seconds...")
+                        except Exception as e:
+                            print(f"[Main Error] Unexpected error in main loop: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            print("Retrying next cycle...")
+                            
+                        await asyncio.sleep(POLL_INTERVAL)
+                        
+        except KeyboardInterrupt:
+            print("\nShutting down bot.")
+            sys.exit(0)
+        except Exception as conn_err:
+            print(f"[WebSocket Connection Error] Connection failed: {conn_err}. Reconnecting in 5 seconds...")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
     try:
