@@ -19,7 +19,23 @@ from xrpl.models.transactions import (
     Payment,
     CheckCreate
 )
-from xrpl.asyncio.transaction import submit_and_wait
+from xrpl.asyncio.transaction import submit_and_wait as xrpl_submit_and_wait
+
+async def submit_and_wait(tx, client, wallet_obj):
+    global LAST_FALLBACK_SEQUENCE
+    try:
+        response = await xrpl_submit_and_wait(tx, client, wallet_obj)
+        res_code = None
+        if response.is_successful():
+            meta = response.result.get("meta", {})
+            if isinstance(meta, dict):
+                res_code = meta.get("TransactionResult")
+        if not (res_code and (res_code.startswith("tes") or res_code.startswith("tec"))):
+            LAST_FALLBACK_SEQUENCE = None
+        return response
+    except Exception as e:
+        LAST_FALLBACK_SEQUENCE = None
+        raise e
 
 # Load environment variables
 load_dotenv()
