@@ -92,6 +92,16 @@ TARGET_SELL_FLOOR_DROPS = int(TARGET_SELL_FLOOR_XRP * 1_000_000)
 AVAILABLE_TICKETS = []
 TICKET_LOCK = asyncio.Lock()
 PURCHASE_COST_CACHE = {}
+LAST_FALLBACK_SEQUENCE = None
+
+# Startup validations
+if MAX_FEE_DROPS < BASE_FEE_DROPS:
+    print(f"[Warning] MAX_FEE_DROPS ({MAX_FEE_DROPS}) is less than BASE_FEE_DROPS ({BASE_FEE_DROPS}). Clamping MAX_FEE_DROPS to BASE_FEE_DROPS.")
+    MAX_FEE_DROPS = BASE_FEE_DROPS
+
+if COLLECTION_BID_ENABLED and COLLECTION_BID_XRP > TARGET_BUY_FLOOR_XRP:
+    print(f"[CRITICAL SAFETY WARNING] COLLECTION_BID_XRP ({COLLECTION_BID_XRP} XRP) exceeds TARGET_BUY_FLOOR_XRP ({TARGET_BUY_FLOOR_XRP} XRP). Disabling Collection Bidding for safety!")
+    COLLECTION_BID_ENABLED = False
 
 print("=" * 80)
 print("              XRPL NFT FLOOR SWEEPER & RELISTING BOT")
@@ -120,15 +130,6 @@ if BOT_MODE == "COLLECT_PROFIT":
     print(f"Sweep Method:  {PROFIT_TRANSFER_METHOD}")
     print(f"Operating Buffer: {MIN_OPERATING_BUFFER_XRP} XRP")
     print(f"Min Sweep Trigger: {PROFIT_SWEEP_MIN_TRIGGER_XRP} XRP")
-
-# Startup validations
-if MAX_FEE_DROPS < BASE_FEE_DROPS:
-    print(f"[Warning] MAX_FEE_DROPS ({MAX_FEE_DROPS}) is less than BASE_FEE_DROPS ({BASE_FEE_DROPS}). Clamping MAX_FEE_DROPS to BASE_FEE_DROPS.")
-    MAX_FEE_DROPS = BASE_FEE_DROPS
-
-if COLLECTION_BID_ENABLED and COLLECTION_BID_XRP > TARGET_BUY_FLOOR_XRP:
-    print(f"[CRITICAL SAFETY WARNING] COLLECTION_BID_XRP ({COLLECTION_BID_XRP} XRP) exceeds TARGET_BUY_FLOOR_XRP ({TARGET_BUY_FLOOR_XRP} XRP). Disabling Collection Bidding for safety!")
-    COLLECTION_BID_ENABLED = False
 
 # Wallet Initialization
 seed = os.getenv("XRPL_SEED", "").strip()
@@ -261,6 +262,7 @@ async def get_tx_sequence_and_ticket(client_obj):
     Get the next sequence or ticket sequence to use for a transaction.
     Returns (sequence, ticket_sequence) tuple.
     """
+    global LAST_FALLBACK_SEQUENCE
     async with TICKET_LOCK:
         ticket = await get_next_ticket(client_obj)
         if ticket is not None:
@@ -271,8 +273,12 @@ async def get_tx_sequence_and_ticket(client_obj):
         try:
             resp = await client_obj.request(AccountInfo(account=wallet.classic_address))
             if resp.is_successful():
-                seq = resp.result.get("account_data", {}).get("Sequence")
-                return seq, None
+                ledger_seq = resp.result.get("account_data", {}).get("Sequence")
+                if LAST_FALLBACK_SEQUENCE is None or LAST_FALLBACK_SEQUENCE < ledger_seq:
+                    LAST_FALLBACK_SEQUENCE = ledger_seq
+                else:
+                    LAST_FALLBACK_SEQUENCE += 1
+                return LAST_FALLBACK_SEQUENCE, None
         except Exception as e:
             print(f"[Warning] Failed to fetch standard sequence: {e}")
         return None, None
@@ -1180,8 +1186,13 @@ async def scan_and_sweep(client_obj, http_client, api_data=None, collection_nfts
         tasks.append((nftoken_id, run_buy_task(nftoken_id, owner, offer_id, price_drops, destination, item["broker_fee_mult"])))
 
     if tasks:
-        print(f"[Sweep] Executing {len(tasks)} sweeps concurrently in this cycle using Ticket sequences...")
-        await asyncio.gather(*(t[1] for t in tasks))
+        if AVAILABLE_TICKETS:
+            print(f"[Sweep] Executing {len(tasks)} sweeps concurrently in this cycle using Ticket sequences...")
+            await asyncio.gather(*(t[1] for t in tasks))
+        else:
+            print(f"[Sweep] Executing {len(tasks)} sweeps sequentially in this cycle because tickets are empty...")
+            for t in tasks:
+                await t[1]
 
 async def manage_profits(client_obj):
     """
