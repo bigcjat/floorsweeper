@@ -1010,7 +1010,7 @@ async def manage_inventory(client_obj, http_client, active_offers):
         unlisted_nfts.append(nft)
 
     if unlisted_nfts:
-        if AVAILABLE_TICKETS:
+        if len(AVAILABLE_TICKETS) >= len(unlisted_nfts):
             print(f"[Inventory] Tickets are active ({len(AVAILABLE_TICKETS)} available). Creating {len(unlisted_nfts)} sell listings concurrently...")
             tasks = []
             tx_fee = int(calculate_tx_fee())
@@ -1202,7 +1202,7 @@ async def scan_and_sweep(client_obj, http_client, api_data=None, collection_nfts
         tasks.append((nftoken_id, run_buy_task(nftoken_id, owner, offer_id, price_drops, destination, item["broker_fee_mult"])))
 
     if tasks:
-        if AVAILABLE_TICKETS:
+        if len(AVAILABLE_TICKETS) >= len(tasks) * 2:
             print(f"[Sweep] Executing {len(tasks)} sweeps concurrently in this cycle using Ticket sequences...")
             await asyncio.gather(*(t[1] for t in tasks))
         else:
@@ -1448,7 +1448,7 @@ async def manage_collection_bids(client_obj, http_client):
         else:
             print(f"[DRY RUN] Would place {COLLECTION_BID_XRP} XRP buy offer on {nft_id} (Ticket: {ticket})")
 
-    if AVAILABLE_TICKETS:
+    if len(AVAILABLE_TICKETS) >= len(bids_to_run):
         print(f"[Collection Bids] Found {len(missing_bids)} NFTs lacking buy offers. Placing {len(bids_to_run)} concurrent bids at {COLLECTION_BID_XRP} XRP in this cycle...")
         await asyncio.gather(*(place_one_bid(nft_id, owner) for nft_id, owner in bids_to_run))
     else:
