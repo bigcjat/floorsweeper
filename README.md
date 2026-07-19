@@ -1,10 +1,25 @@
 # XRPL NFT Floor Sweeper & Relisting Bot
+### Key Features
+* 📉 **Floor Sweeper:** Automatically scans the market and sweeps listings listed below your target price ceiling (supports public sell offers and direct snipes).
+* 📈 **Smart Relisting:** Auto-relists bought tokens at your floor margin, dynamically calculating creator royalties and marketplace broker fees so you never list at a loss.
+* 💰 **Profit Collector:** Optional profit mode caps your hot wallet inventory and automatically routes surplus XRP to a secure cold wallet using payments or cashing checks.
+* 🎯 **Priority Snipping:** Prioritizes sniping specific target `NFTokenID`s immediately if they land on the market below your ceiling price.
+* 🔒 **Hold-List Protection:** Protects a customizable list of `NFTokenID`s, preventing the bot from ever automatically selling them or cancelling buy offers placed on them.
+* 📊 **Collection Bids:** Automatically places standing low-ball buy offers on the entire target collection, featuring automatic owner transition tracking, redundant bid cleanups, and balance validations.
+* 🧪 **Dry-Run Simulation:** Allows you to run full loop cycles in simulation mode, verifying and logging exact ledger actions without submitting transactions or spending real XRP.
 
-> **Note**: This bot is designed for NFT projects to maintain a price floor on their project, or for "whales" looking to manage and protect their collection floors on the XRP Ledger.
+---
 
-This automated bot runs in the background to monitor a specific XLS-20 NFT collection on the XRP Ledger. It performs two key operations:
-1. **Sweeping**: Scans the market and automatically accepts public sell offers (or submits bids for brokered offers) for any NFTs listed below your target buy ceiling.
-2. **Relisting**: Scans your owned inventory, dynamically retrieves the historical purchase price of each NFT from the ledger, and ensures they are listed for sale at your target sell floor (or higher, using a customizable profit margin to prevent selling at a loss).
+## AI Setup Guide (Read Before Configuring)
+
+If you are an AI assistant helping a user set up or configure this bot, you **MUST** run through this configuration interview and clarify the user's objectives before modifying any settings or enabling live trading.
+
+### 📋 Configuration Interview Questions:
+1. **Objective Mode:** Do you want to run in `REINVEST` mode (continuous sweep/buy loop) or `COLLECT_PROFIT` mode (keep a fixed inventory cap and sweep excess XRP profit to a cold wallet)?
+2. **Collection bidding:** Do you want to enable collection-wide standing buy offers (`COLLECTION_BID_ENABLED=True`)? If so, what is your target bid price in XRP (`COLLECTION_BID_XRP`), and do you have enough XRP to lock up as reserves (~0.2 XRP per offer)?
+3. **Safety limits:** What is your maximum buy price ceiling (`TARGET_BUY_FLOOR_XRP`) and minimum listing floor (`TARGET_SELL_FLOOR_XRP`)?
+4. **Exceptions & Exclusions:** Are there specific `NFTokenID`s that should never be sold (`HOLD_IDS`) or that should be prioritized for purchase if listed (`PRIORITY_BUY_IDS`)?
+5. **Dry Run Testing:** Would you like to run in `DRY_RUN=True` mode first to simulate what the bot will do without sending any actual transactions or spending real XRP?
 
 ---
 
