@@ -24,12 +24,12 @@ This automated bot runs in the background to monitor a specific XLS-20 NFT colle
 
 Before running the bot, ensure you have the following:
 
-1. **Python 3.7+**
+1. **Python 3.11+** (e.g. `python3.11`)
 2. **A Funded XRPL Wallet**: You need a wallet funded with XRP to cover transactions, buy offers, and ledger object reserves.
    * *Note: The ledger locks up `0.2 XRP` owner reserve per active sell/buy offer. For NFT storage, the ledger uses `NFTokenPage` objects which host up to 32 NFTs each; each page adds a `0.2 XRP` owner reserve (rather than 0.2 XRP per individual NFT). Ensure you have sufficient liquid XRP beyond your target purchase prices.*
 3. **Required Packages**: Install the XRPL Python SDK and environment variables loader:
    ```bash
-   pip install xrpl-py python-dotenv requests
+   pip3.11 install xrpl-py python-dotenv requests httpx
    ```
 
 ---
@@ -114,7 +114,7 @@ Copy the generated `Secret Seed` and paste it as `XRPL_SEED` in your `.env`. Mak
 ### 1. Test in Dry Run Mode
 Always start the bot in dry run mode first to inspect the scanned data and verify your configuration:
 ```bash
-python3 floor_bot.py
+python3.11 floor_bot.py
 ```
 
 ### 2. Run in Live Production
@@ -122,7 +122,7 @@ To run the bot in live trading mode in the background:
 1. Set `DRY_RUN=False` in `.env`.
 2. Launch the script using `nohup` so it continues running when you close your terminal:
    ```bash
-   nohup python3 -u floor_bot.py > floor_bot.log 2>&1 &
+   nohup python3.11 -u floor_bot.py > floor_bot.log 2>&1 &
    ```
 3. Monitor logs in real time:
    ```bash
