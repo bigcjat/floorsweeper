@@ -105,7 +105,28 @@ Copy the generated `Secret Seed` and paste it as `XRPL_SEED` in your `.env`. Mak
 * `MIN_OPERATING_BUFFER_XRP`: The minimum free XRP balance to retain in the hot wallet for reserves/fees/tickets (only used in `COLLECT_PROFIT` mode; default is `30.0` XRP).
 * `PROFIT_SWEEP_MIN_TRIGGER_XRP`: The minimum surplus XRP required to trigger a transfer, preventing transaction history spam (default is `5.0` XRP).
 
+### Global Collection Offers (Collection-Wide Bidding)
+* `COLLECTION_BID_ENABLED`: Set to `True` to enable placing low-ball buy offers (bids) on the entire NFT collection. Default is `False`.
+* `COLLECTION_BID_XRP`: The target bid price in XRP for the collection-wide offers. Default is `2.0`.
 
+---
+
+## Global Collection Offers (Collection-Wide Bidding)
+
+This feature allows you to place low-ball standing bids on the **entire** target NFT collection. 
+
+> [!WARNING]
+> **Extremely High Reserve Requirements:**
+> Placing a buy offer on every single NFT in a collection of 10,000 tokens requires **~1,984 XRP** in locked ledger reserves (0.2 XRP owner reserve per offer). This XRP is not spent or sent to anyone; it is locked on-ledger as collateral for the offers. 
+> * **Automatic Refund:** When an offer is accepted or cancelled, its 0.2 XRP reserve is immediately returned to your spendable balance.
+> * **Balance Safeguard:** The bot automatically checks your wallet's free balance. It will **not** place any new bids unless your wallet contains enough XRP to cover the account root reserve (10 XRP), existing NFT reserves, ticket/gas fees, and at least 2 accepted buy transactions.
+
+### Key Logic & Features:
+1. **Ownership Transitions:** 
+   * If you sweep or purchase a bid-targeted NFT (so it comes into your possession), the bot automatically detects ownership and **cancels your active buy offer** on it, freeing up the 0.2 XRP reserve.
+   * If you relist and sell that NFT (so you no longer own it), the bot detects it is no longer in your possession and **automatically places the buy offer back** on the ledger.
+2. **Obsolete Bid Cleanup:** If you disable this feature (`COLLECTION_BID_ENABLED=False`) or change the bid price (`COLLECTION_BID_XRP`), the bot automatically identifies all existing active buy offers on-ledger that are now obsolete and cancels them to reclaim your locked reserves.
+3. **Paced Submissions (Max 10 per ledger):** Submitting thousands of bids at once would cause network spam and fee escalation. The bot strictly limits new creations or cancels to **at most 10 transactions per cycle/ledger**, building or cleaning up your bids safely over time.
 
 ---
 
