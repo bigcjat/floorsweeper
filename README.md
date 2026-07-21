@@ -113,7 +113,8 @@ Copy the generated `Secret Seed` and paste it as `XRPL_SEED` in your `.env`. Mak
   * `REINVEST`: (Default) The bot continuously sweeps any collection NFTs listed below your target buy floor.
   * `COLLECT_PROFIT`: The bot holds a capped inventory of collection NFTs and routes excess XRP profits to a secure cold wallet.
 * `MAX_OWNED_LIMIT`: The maximum number of collection NFTs to hold in your hot wallet before pausing sweeps (only used in `COLLECT_PROFIT` mode; defaults to `10000`).
-* `PROFIT_TARGET_WALLET`: The classic address of the cold/recipient wallet where surplus XRP profit will be automatically transferred.
+* `PROFIT_TARGET_WALLET`: The address of the cold/recipient wallet where surplus XRP profit will be automatically transferred.
+  * **WARNING:** Do NOT use a classic exchange deposit address (which requires a destination tag). If sending directly to an exchange, use the X-address format (e.g. `X...`) which natively encodes the destination tag.
 * `PROFIT_TRANSFER_METHOD`: The XRPL transaction method used to sweep profits:
   * `PAYMENT`: (Default) Submits standard direct XRP `Payment` transactions to the target wallet.
   * `CHECK`: Submits native `CheckCreate` transactions, allowing the cold wallet to cash the check at its convenience.
