@@ -1,0 +1,4 @@
+xrpl-py==4.1.0
+python-dotenv==1.0.0
+httpx==0.18.2
+websockets==15.0.1

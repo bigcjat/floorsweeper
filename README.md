@@ -42,9 +42,9 @@ Before running the bot, ensure you have the following:
 1. **Python 3.11+** (e.g. `python3.11`)
 2. **A Funded XRPL Wallet**: You need a wallet funded with XRP to cover transactions, buy offers, and ledger object reserves.
    * *Note: The ledger locks up `0.2 XRP` owner reserve per active sell/buy offer. For NFT storage, the ledger uses `NFTokenPage` objects which host up to 32 NFTs each; each page adds a `0.2 XRP` owner reserve (rather than 0.2 XRP per individual NFT). Ensure you have sufficient liquid XRP beyond your target purchase prices.*
-3. **Required Packages**: Install the XRPL Python SDK and environment variables loader:
+3. **Required Packages**: Install the pinned dependencies using the requirements file:
    ```bash
-   pip3.11 install xrpl-py python-dotenv requests httpx
+   python3.11 -m pip install -r requirements.txt
    ```
 
 ---
