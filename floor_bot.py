@@ -656,7 +656,7 @@ async def validate_and_cleanup_offers(client_obj, api_data):
     """
     Validate all our active sell and buy offers on-ledger:
     1. Cancel sell offers for NFTs we no longer own (orphans).
-    2. Cancel duplicate sell offers for the same NFT (keeping the lowest price/most recent).
+    2. Cancel duplicate sell offers for the same NFT (keeping the highest price).
     3. Cancel buy offers that are expired, no longer listed under floor, or have incorrect amounts.
     """
     print("[Validation] Validating all active sell and buy offers on-ledger...")
@@ -843,7 +843,7 @@ async def validate_and_cleanup_offers(client_obj, api_data):
     # Detect duplicate sell offers
     for nft_id, sell_list in nft_to_sell_offers.items():
         if len(sell_list) > 1:
-            # Sort by price descending, then index (keep the highest/best offer, cancel others)
+            # Sort by price descending (keep the highest price offer, cancel others)
             def get_amount(x):
                 val = x.get("Amount")
                 if isinstance(val, (str, int, float)):
