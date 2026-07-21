@@ -135,7 +135,7 @@ This feature allows you to place low-ball standing bids on the **entire** target
 > **Extremely High Reserve Requirements:**
 > Placing a buy offer on every single NFT in a collection of 10,000 tokens requires **~1,984 XRP** in locked ledger reserves (0.2 XRP owner reserve per offer). This XRP is not spent or sent to anyone; it is locked on-ledger as collateral for the offers. 
 > * **Automatic Refund:** When an offer is accepted or cancelled, its 0.2 XRP reserve is immediately returned to your spendable balance.
-> * **Balance Safeguard:** The bot automatically checks your wallet's free balance. It will **not** place any new bids unless your wallet contains enough XRP to cover the account root reserve (10 XRP), existing NFT reserves, ticket/gas fees, and at least 2 accepted buy transactions.
+> * **Balance Safeguard:** The bot automatically checks your wallet's free balance. It will **not** place any new bids unless your wallet contains enough XRP to cover the account root reserve (1 XRP), existing NFT reserves, ticket/gas fees, and at least 2 accepted buy transactions.
 
 ### Key Logic & Features:
 1. **Ownership Transitions:** 
