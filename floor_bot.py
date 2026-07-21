@@ -300,8 +300,8 @@ async def get_next_ticket(client_obj):
     if not AVAILABLE_TICKETS:
         try:
             await _ensure_ticket_pool_unlocked(client_obj)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Warning] Failed to replenish ticket pool in get_next_ticket: {e}")
     if AVAILABLE_TICKETS:
         return AVAILABLE_TICKETS.pop(0)
     return None
@@ -476,14 +476,48 @@ async def populate_purchase_cost_cache(client_obj):
             try:
                 cost = await get_purchase_price_from_ledger(client_obj, http_client, nft_id)
                 PURCHASE_COST_CACHE[nft_id] = cost
-            except Exception:
-                # Default to 5.0 XRP if history cannot be resolved
-                PURCHASE_COST_CACHE[nft_id] = 5_000_000
+            except Exception as e:
+                # Do not set a default fallback, leave it unknown so we do not list at a loss
+                print(f"[Cost Cache Warning] Failed to determine cost for owned NFT {nft_id}: {e}")
 
         # Query history for all owned target NFTs in parallel
         await asyncio.gather(*(fetch_cost(nft) for nft in collection_nfts))
 
     print(f"[Cost Cache] Initialized cache with {len(PURCHASE_COST_CACHE)} known NFT purchase costs.")
+
+async def verify_sell_offer_price(client_obj, nftoken_id, offer_id, price_drops):
+    """
+    Query the ledger directly to verify that the sell offer exists,
+    matches the expected price, and is below safety caps.
+    """
+    try:
+        req = NFTSellOffers(nftoken_id=nftoken_id)
+        resp = await client_obj.request(req)
+        if resp.is_successful():
+            offers = resp.result.get("offers", [])
+            for offer in offers:
+                if offer.get("nft_offer_index") == offer_id:
+                    amount_val = offer.get("amount")
+                    try:
+                        actual_drops = int(amount_val)
+                        if actual_drops != price_drops:
+                            print(f"[SAFETY WARNING] Price mismatch for offer {offer_id}: on-ledger actual {actual_drops / 1_000_000} XRP vs API reported {price_drops / 1_000_000} XRP!")
+                            return False
+                        if actual_drops > TARGET_BUY_FLOOR_DROPS:
+                            print(f"[SAFETY WARNING] Price exceeds safety cap limit: {actual_drops / 1_000_000} XRP!")
+                            return False
+                        return True
+                    except (ValueError, TypeError):
+                        print(f"[SAFETY WARNING] Invalid amount format on-ledger for offer {offer_id}: {amount_val}")
+                        return False
+            print(f"[SAFETY WARNING] Sell offer {offer_id} not found on-ledger for NFT {nftoken_id}.")
+            return False
+        else:
+            print(f"[Warning] Failed to fetch on-ledger sell offers for safety check: {resp.result}")
+            return False
+    except Exception as e:
+        print(f"[Warning] Exception during on-ledger sell offer safety check: {e}")
+        return False
 
 async def execute_direct_buy(client_obj, offer_id, nftoken_id, price_drops):
     """
@@ -491,6 +525,12 @@ async def execute_direct_buy(client_obj, offer_id, nftoken_id, price_drops):
     """
     if price_drops > TARGET_BUY_FLOOR_DROPS:
         print(f"[CRITICAL SAFETY TRIGGERED] Blocked direct buy attempt of {price_drops / 1_000_000} XRP which exceeds absolute safety limit of {TARGET_BUY_FLOOR_XRP} XRP.")
+        return False, 0
+
+    # On-ledger safety check to verify price and presence of the offer
+    is_valid = await verify_sell_offer_price(client_obj, nftoken_id, offer_id, price_drops)
+    if not is_valid:
+        print(f"[SAFETY CANCEL] Aborting direct buy of NFT {nftoken_id} due to on-ledger price verification failure.")
         return False, 0
 
     seq, ticket = await get_tx_sequence_and_ticket(client_obj)
@@ -792,21 +832,25 @@ async def validate_and_cleanup_offers(client_obj, api_data):
                 offers_to_cancel.append(offer_index)
             else:
                 # Auto-Alignment check: verify that the live price matches our current target price
-                cost_drops = PURCHASE_COST_CACHE.get(nft_id, 5_000_000) # Default to 5.0 XRP if unknown
-                target_relist_price = calculate_relist_price(nft_id, cost_drops)
-                current_price = 0
-                amount_val = obj.get("Amount")
-                if isinstance(amount_val, (str, int, float)):
-                    try:
-                        current_price = int(amount_val)
-                    except ValueError:
-                        pass
-                
-                if current_price != target_relist_price:
-                    print(f"[Validation] NFT {nft_id} listing price is out of alignment: active {current_price / 1_000_000} XRP vs target {target_relist_price / 1_000_000} XRP. Scheduling cancel to relist.")
-                    offers_to_cancel.append(offer_index)
-                else:
+                cost_drops = PURCHASE_COST_CACHE.get(nft_id)
+                if cost_drops is None:
+                    print(f"[Validation Warning] Skipping price alignment check for NFT {nft_id} (cost basis unknown).")
                     nft_to_sell_offers.setdefault(nft_id, []).append(obj)
+                else:
+                    target_relist_price = calculate_relist_price(nft_id, cost_drops)
+                    current_price = 0
+                    amount_val = obj.get("Amount")
+                    if isinstance(amount_val, (str, int, float)):
+                        try:
+                            current_price = int(amount_val)
+                        except ValueError:
+                            pass
+                    
+                    if current_price != target_relist_price:
+                        print(f"[Validation] NFT {nft_id} listing price is out of alignment: active {current_price / 1_000_000} XRP vs target {target_relist_price / 1_000_000} XRP. Scheduling cancel to relist.")
+                        offers_to_cancel.append(offer_index)
+                    else:
+                        nft_to_sell_offers.setdefault(nft_id, []).append(obj)
         else:
             # Buy offer check
             if nft_id in HOLD_IDS:
