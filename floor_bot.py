@@ -79,6 +79,7 @@ COLLECTION_BID_DROPS = int(COLLECTION_BID_XRP * 1_000_000)
 # Operational Modes & Profit Collector Configuration
 BOT_MODE = os.getenv("BOT_MODE", "REINVEST").strip().upper()
 MAX_OWNED_LIMIT = int(os.getenv("MAX_OWNED_LIMIT", "50"))
+# Warning: Do NOT use a classic exchange wallet (requires destination tag). Use an X-address format for exchanges.
 PROFIT_TARGET_WALLET = os.getenv("PROFIT_TARGET_WALLET", "").strip()
 PROFIT_TRANSFER_METHOD = os.getenv("PROFIT_TRANSFER_METHOD", "PAYMENT").strip().upper()
 MIN_OPERATING_BUFFER_XRP = float(os.getenv("MIN_OPERATING_BUFFER_XRP", "30.0"))
