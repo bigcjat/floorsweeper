@@ -109,9 +109,15 @@ PROFIT_TRANSFER_METHOD = os.getenv("PROFIT_TRANSFER_METHOD", "PAYMENT").strip().
 MIN_OPERATING_BUFFER_XRP = float(os.getenv("MIN_OPERATING_BUFFER_XRP", "30.0"))
 PROFIT_SWEEP_MIN_TRIGGER_XRP = float(os.getenv("PROFIT_SWEEP_MIN_TRIGGER_XRP", "5.0"))
 
-if BOT_MODE == "COLLECT_PROFIT" and not PROFIT_TARGET_WALLET:
-    print("[Warning] BOT_MODE is COLLECT_PROFIT but PROFIT_TARGET_WALLET is not configured. Falling back to REINVEST mode.")
-    BOT_MODE = "REINVEST"
+if BOT_MODE == "COLLECT_PROFIT":
+    if not PROFIT_TARGET_WALLET:
+        print("[Warning] BOT_MODE is COLLECT_PROFIT but PROFIT_TARGET_WALLET is not configured. Falling back to REINVEST mode.")
+        BOT_MODE = "REINVEST"
+    else:
+        from xrpl.core.addresscodec import is_valid_classic_address, is_valid_xaddress
+        if not (is_valid_classic_address(PROFIT_TARGET_WALLET) or is_valid_xaddress(PROFIT_TARGET_WALLET)):
+            print(f"[CRITICAL ERROR] PROFIT_TARGET_WALLET '{PROFIT_TARGET_WALLET}' is not a valid XRPL classic or X-address!")
+            sys.exit(1)
 
 def parse_id_list(env_var_name):
     val = os.getenv(env_var_name, "").strip()
