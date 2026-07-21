@@ -80,7 +80,12 @@ ISSUER = os.getenv("TARGET_ISSUER", "rDropCHANEgmG7FBz1nzPpG27BGzWjnCnn").strip(
 TAXON = int(os.getenv("TARGET_TAXON", "0"))
 
 # Brokers configuration: mapping of broker address -> fee multiplier
-default_brokers = {"rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC": 1.01589}
+# XRP Cafe: rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC (1.589%)
+# Bidds / onXRP: rpZqTPC8GvrSvEfFsUuHkmPCg29GdQuXhC (1.5%)
+default_brokers = {
+    "rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC": 1.01589,
+    "rpZqTPC8GvrSvEfFsUuHkmPCg29GdQuXhC": 1.015
+}
 brokers_env = os.getenv("BROKERS_CONFIG", "").strip()
 if brokers_env:
     try:
