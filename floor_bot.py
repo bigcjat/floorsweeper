@@ -497,7 +497,7 @@ async def verify_sell_offer_price(client_obj, nftoken_id, offer_id, price_drops)
     matches the expected price, and is below safety caps.
     """
     try:
-        req = NFTSellOffers(nftoken_id=nftoken_id)
+        req = NFTSellOffers(nft_id=nftoken_id)
         resp = await client_obj.request(req)
         if resp.is_successful():
             offers = resp.result.get("offers", [])
