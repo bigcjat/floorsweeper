@@ -4,7 +4,31 @@ import json
 import asyncio
 import time
 import httpx
+import logging
+from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
+
+# Set up logging to console and a rotating log file (Max 10MB per file, keep 5 backups)
+log_formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+log_handler = RotatingFileHandler('floor_bot.log', maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
+log_handler.setFormatter(log_formatter)
+log_handler.setLevel(logging.INFO)
+
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(logging.Formatter('%(message)s'))
+console_handler.setLevel(logging.INFO)
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+logger.handlers = []
+logger.addHandler(log_handler)
+logger.addHandler(console_handler)
+
+# Override print to route all calls through the rotating logger
+def print(*args, **kwargs):
+    message = " ".join(str(arg) for arg in args)
+    logger.info(message)
 
 # XRPL SDK imports
 from xrpl.asyncio.clients import AsyncJsonRpcClient, AsyncWebsocketClient

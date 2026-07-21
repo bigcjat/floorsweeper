@@ -157,9 +157,9 @@ python3.11 floor_bot.py
 ### 2. Run in Live Production
 To run the bot in live trading mode in the background:
 1. Set `DRY_RUN=False` in `.env`.
-2. Launch the script using `nohup` so it continues running when you close your terminal:
+2. Launch the script using `nohup` (standard output is redirected to `/dev/null` because the bot writes and rotates its own `floor_bot.log` internally to prevent disk space exhaustion):
    ```bash
-   nohup python3.11 -u floor_bot.py > floor_bot.log 2>&1 &
+   nohup python3.11 -u floor_bot.py > /dev/null 2>&1 &
    ```
 3. Monitor logs in real time:
    ```bash
