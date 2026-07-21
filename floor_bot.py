@@ -70,15 +70,15 @@ else:
 # Safety limits & user preferences
 MAX_ACTIVE_BUYS = int(os.getenv("MAX_ACTIVE_BUYS", "4"))
 BUY_OFFER_EXPIRATION_SEC = int(os.getenv("BUY_OFFER_EXPIRATION_SEC", "600"))
-RELIST_MARKUP_DIVISOR = float(os.getenv("RELIST_MARKUP_DIVISOR", "0.9"))
+RELIST_MARKUP_DIVISOR = float(os.getenv("RELIST_MARKUP_DIVISOR", "0.8"))
 AUTO_RELIST = os.getenv("AUTO_RELIST", "True").lower() == "true"
 COLLECTION_BID_ENABLED = os.getenv("COLLECTION_BID_ENABLED", "False").lower() == "true"
-COLLECTION_BID_XRP = float(os.getenv("COLLECTION_BID_XRP", "0.0"))
+COLLECTION_BID_XRP = float(os.getenv("COLLECTION_BID_XRP", "2.0"))
 COLLECTION_BID_DROPS = int(COLLECTION_BID_XRP * 1_000_000)
 
 # Operational Modes & Profit Collector Configuration
 BOT_MODE = os.getenv("BOT_MODE", "REINVEST").strip().upper()
-MAX_OWNED_LIMIT = int(os.getenv("MAX_OWNED_LIMIT", "50"))
+MAX_OWNED_LIMIT = int(os.getenv("MAX_OWNED_LIMIT", "10000"))
 # Warning: Do NOT use a classic exchange wallet (requires destination tag). Use an X-address format for exchanges.
 PROFIT_TARGET_WALLET = os.getenv("PROFIT_TARGET_WALLET", "").strip()
 PROFIT_TRANSFER_METHOD = os.getenv("PROFIT_TRANSFER_METHOD", "PAYMENT").strip().upper()
@@ -197,9 +197,9 @@ async def get_available_tickets(client_obj):
         print(f"[Tickets Warning] Failed to query tickets: {e}")
     return sorted(tickets)
 
-async def ensure_ticket_pool(client_obj):
+async def _ensure_ticket_pool_unlocked(client_obj):
     """
-    Check if available tickets are low and replenish the pool if necessary.
+    Internal unlocked helper to check and replenish the ticket pool.
     """
     global AVAILABLE_TICKETS
     
@@ -253,9 +253,17 @@ async def ensure_ticket_pool(client_obj):
         except Exception as e:
             print(f"[Tickets Error] Failed to create tickets: {e}")
 
+async def ensure_ticket_pool(client_obj):
+    """
+    Public thread-safe/concurrency-safe entry point to replenish ticket pool.
+    """
+    async with TICKET_LOCK:
+        await _ensure_ticket_pool_unlocked(client_obj)
+
 async def get_next_ticket(client_obj):
     """
     Pop the next ticket from the queue. Top up if empty.
+    Note: Must be called while holding TICKET_LOCK.
     """
     global AVAILABLE_TICKETS
     
@@ -267,7 +275,7 @@ async def get_next_ticket(client_obj):
 
     if not AVAILABLE_TICKETS:
         try:
-            await ensure_ticket_pool(client_obj)
+            await _ensure_ticket_pool_unlocked(client_obj)
         except Exception:
             pass
     if AVAILABLE_TICKETS:
