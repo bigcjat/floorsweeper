@@ -72,7 +72,7 @@ XRPL_NODE = os.getenv("XRPL_NODE", "https://s1.ripple.com:51234/")
 DRY_RUN = os.getenv("DRY_RUN", "True").lower() == "true"
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "20"))
 TARGET_BUY_FLOOR_XRP = float(os.getenv("TARGET_BUY_FLOOR_XRP", "4.5"))
-TARGET_SELL_FLOOR_XRP = float(os.getenv("TARGET_SELL_FLOOR_XRP", "10.0"))
+TARGET_SELL_FLOOR_XRP = float(os.getenv("TARGET_SELL_FLOOR_XRP", "5.0"))
 XRP_API_KEY = os.getenv("XRP_API_KEY", "").strip()
 
 # NFT Collection Properties
@@ -481,18 +481,17 @@ async def populate_purchase_cost_cache(client_obj):
 
     print(f"[Cost Cache] Found {len(collection_nfts)} owned target NFTs. Querying ledger histories concurrently...")
 
-    sem = asyncio.Semaphore(3)
     async with httpx.AsyncClient() as http_client:
         async def fetch_cost(nft):
-            async with sem:
-                nft_id = nft.get("NFTokenID")
-                try:
-                    cost = await get_purchase_price_from_ledger(client_obj, http_client, nft_id)
-                    PURCHASE_COST_CACHE[nft_id] = cost
-                except Exception as e:
-                    print(f"[Cost Cache Warning] Failed to determine cost for owned NFT {nft_id}: {e}")
+            nft_id = nft.get("NFTokenID")
+            try:
+                cost = await get_purchase_price_from_ledger(client_obj, http_client, nft_id)
+                PURCHASE_COST_CACHE[nft_id] = cost
+            except Exception as e:
+                # Do not set a default fallback, leave it unknown so we do not list at a loss
+                print(f"[Cost Cache Warning] Failed to determine cost for owned NFT {nft_id}: {e}")
 
-        # Query history for all owned target NFTs in parallel with rate limit
+        # Query history for all owned target NFTs in parallel
         await asyncio.gather(*(fetch_cost(nft) for nft in collection_nfts))
 
     print(f"[Cost Cache] Initialized cache with {len(PURCHASE_COST_CACHE)} known NFT purchase costs.")
@@ -844,21 +843,25 @@ async def validate_and_cleanup_offers(client_obj, api_data):
                 offers_to_cancel.append(offer_index)
             else:
                 # Auto-Alignment check: verify that the live price matches our current target price
-                cost_drops = PURCHASE_COST_CACHE.get(nft_id, 0)
-                target_relist_price = calculate_relist_price(nft_id, cost_drops)
-                current_price = 0
-                amount_val = obj.get("Amount")
-                if isinstance(amount_val, (str, int, float)):
-                    try:
-                        current_price = int(amount_val)
-                    except ValueError:
-                        pass
-                
-                if current_price != target_relist_price:
-                    print(f"[Validation] NFT {nft_id} listing price is out of alignment: active {current_price / 1_000_000} XRP vs target {target_relist_price / 1_000_000} XRP. Scheduling cancel to relist.")
-                    offers_to_cancel.append(offer_index)
-                else:
+                cost_drops = PURCHASE_COST_CACHE.get(nft_id)
+                if cost_drops is None:
+                    print(f"[Validation Warning] Skipping price alignment check for NFT {nft_id} (cost basis unknown).")
                     nft_to_sell_offers.setdefault(nft_id, []).append(obj)
+                else:
+                    target_relist_price = calculate_relist_price(nft_id, cost_drops)
+                    current_price = 0
+                    amount_val = obj.get("Amount")
+                    if isinstance(amount_val, (str, int, float)):
+                        try:
+                            current_price = int(amount_val)
+                        except ValueError:
+                            pass
+                    
+                    if current_price != target_relist_price:
+                        print(f"[Validation] NFT {nft_id} listing price is out of alignment: active {current_price / 1_000_000} XRP vs target {target_relist_price / 1_000_000} XRP. Scheduling cancel to relist.")
+                        offers_to_cancel.append(offer_index)
+                    else:
+                        nft_to_sell_offers.setdefault(nft_id, []).append(obj)
         else:
             # Buy offer check
             if nft_id in HOLD_IDS:
@@ -970,7 +973,7 @@ async def get_purchase_price_from_ledger(client_obj, http_client, nft_id):
             transactions = result.get("transactions", [])
         
         for tx_wrapper in transactions:
-            tx = tx_wrapper.get("tx_json") or tx_wrapper.get("tx", {})
+            tx = tx_wrapper.get("tx", {})
             meta = tx_wrapper.get("meta", {})
             
             if meta.get("TransactionResult") == "tesSUCCESS":
@@ -980,36 +983,33 @@ async def get_purchase_price_from_ledger(client_obj, http_client, nft_id):
                     if deleted.get("LedgerEntryType") == "NFTokenOffer":
                         fields = deleted.get("FinalFields", {})
                         
-                        # Case 1: Brokered / Direct Buy offer where owner is us
+                        # Case 1: Brokered Buy (our buy offer was consumed/deleted)
+                        # Owner is us, and it's a buy offer (Flags & 1 == 0)
                         if (fields.get("Owner") == wallet.classic_address and 
                             not (fields.get("Flags", 0) & 1)):
-                            amount_val = fields.get("Amount", "0")
+                            amount_val = fields.get("Amount")
                             if isinstance(amount_val, (str, int, float)):
                                 try:
                                     return int(amount_val)
                                 except ValueError:
                                     pass
                         
-                        # Case 2: Direct Accept Offer sent by us (buying a sell offer or accepting 0-XRP transfer offer)
+                        # Case 2: Direct Buy (we accepted the seller's sell offer)
+                        # The transaction was sent by us (Account is us) and we accepted this sell offer
                         if (tx.get("TransactionType") == "NFTokenAcceptOffer" and 
-                            tx.get("Account") == wallet.classic_address):
-                            amount_val = fields.get("Amount", "0")
+                            tx.get("Account") == wallet.classic_address and 
+                            deleted.get("LedgerIndex") == tx.get("NFTokenSellOffer")):
+                            amount_val = fields.get("Amount")
                             if isinstance(amount_val, (str, int, float)):
                                 try:
                                     return int(amount_val)
                                 except ValueError:
                                     pass
-
-                # Case 3: Mint / Direct Transfer created/received by us for 0 XRP
-                if (tx.get("TransactionType") in ["NFTokenMint", "NFTokenCreateOffer"] and 
-                    (tx.get("Account") == wallet.classic_address or tx.get("Destination") == wallet.classic_address)):
-                    return 0
                                 
     except Exception as e:
         raise ValueError(f"Error fetching NFT history from ledger: {e}")
     
-    # Default to 0 XRP cost basis for legacy/transferred NFTs if no explicit paid offer recorded
-    return 0
+    raise ValueError(f"No successful Buy Offer or Direct Accept transaction found in nft_history for NFT {nft_id}.")
 
 async def process_single_nft_inventory(client_obj, http_client, nft, our_sell_offers, local_free_bal):
     """
@@ -1024,13 +1024,15 @@ async def process_single_nft_inventory(client_obj, http_client, nft, our_sell_of
         # NFT is already listed. We don't need to check its purchase price or verify its listing price.
         return local_free_bal
 
-    # Not listed, attempt to fetch purchase price, or default to TARGET_SELL_FLOOR_DROPS
+    # Not listed, we need to fetch purchase price to set listing price
     try:
         cost_drops = await get_purchase_price_from_ledger(client_obj, http_client, nft_id)
-        target_relist_price = calculate_relist_price(nft_id, cost_drops)
     except Exception as e:
-        print(f"[Inventory] Cost basis unknown for unlisted NFT {nft_id}. Listing at minimum floor ({TARGET_SELL_FLOOR_XRP} XRP)...")
-        target_relist_price = TARGET_SELL_FLOOR_DROPS
+        print(f"[CRITICAL ERROR] Failed to determine cost for unlisted NFT {nft_id}: {e}")
+        print(f"                 Skipping listing to prevent listing at a loss.")
+        return local_free_bal
+
+    target_relist_price = calculate_relist_price(nft_id, cost_drops)
     tx_fee = int(calculate_tx_fee())
 
     if local_free_bal < (200_000 + tx_fee):
@@ -1563,20 +1565,24 @@ async def async_main():
     """
     Main asynchronous loop of the bot.
     """
+    ws_url = XRPL_NODE.replace("https://", "wss://").replace("http://", "ws://")
+    if ":51234" in ws_url:
+        ws_url = ws_url.replace(":51234", ":51233")
+
     cache_initialized = False
 
     while True:
         try:
-            print(f"Connecting to XRPL Node (JSON-RPC): {XRPL_NODE}")
-            client_obj = AsyncJsonRpcClient(XRPL_NODE)
-            print("Connected to XRPL Node.")
-            
-            if not cache_initialized:
-                # Populate the global purchase cost cache on startup
-                await populate_purchase_cost_cache(client_obj)
-                cache_initialized = True
+            print(f"Connecting to XRPL Node (WebSocket): {ws_url}")
+            async with AsyncWebsocketClient(ws_url) as client_obj:
+                print("Connected to XRPL Node.")
+                
+                if not cache_initialized:
+                    # Populate the global purchase cost cache on startup
+                    await populate_purchase_cost_cache(client_obj)
+                    cache_initialized = True
 
-            async with httpx.AsyncClient() as http_client:
+                async with httpx.AsyncClient() as http_client:
                     while True:
                         try:
                             print("\n" + "-" * 50)
