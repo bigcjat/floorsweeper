@@ -100,6 +100,7 @@ else:
 MAX_ACTIVE_BUYS = int(os.getenv("MAX_ACTIVE_BUYS", "4"))
 BUY_OFFER_EXPIRATION_SEC = int(os.getenv("BUY_OFFER_EXPIRATION_SEC", "600"))
 RELIST_MARKUP_DIVISOR = float(os.getenv("RELIST_MARKUP_DIVISOR", "0.8"))
+PRICE_DECIMALS = int(os.getenv("PRICE_DECIMALS", "2"))
 AUTO_RELIST = os.getenv("AUTO_RELIST", "True").lower() == "true"
 COLLECTION_BID_ENABLED = os.getenv("COLLECTION_BID_ENABLED", "False").lower() == "true"
 COLLECTION_BID_XRP = float(os.getenv("COLLECTION_BID_XRP", "2.0"))
@@ -171,6 +172,7 @@ print(f"Collection Bid:{COLLECTION_BID_XRP} XRP (Enabled: {COLLECTION_BID_ENABLE
 print(f"Priority Buys: {len(PRIORITY_BUY_IDS)} items configured")
 print(f"Hold (No-Sell):{len(HOLD_IDS)} items configured")
 print(f"Relist Divisor:{RELIST_MARKUP_DIVISOR}")
+print(f"Price Decimals:{PRICE_DECIMALS}")
 print(f"Base Fee:      {BASE_FEE_DROPS} drops")
 print(f"Max Fee Limit: {MAX_FEE_DROPS} drops")
 print(f"Dry Run Mode:  {DRY_RUN}")
@@ -445,8 +447,11 @@ def calculate_relist_price(nft_id, cost_drops):
     if divisor <= 0.05:
         divisor = 0.05
 
-    target_price = int(cost_drops / divisor)
-    return max(TARGET_SELL_FLOOR_DROPS, target_price)
+    target_price_xrp = (cost_drops / 1_000_000.0) / divisor
+    rounded_xrp = round(target_price_xrp, PRICE_DECIMALS)
+    target_price_drops = int(rounded_xrp * 1_000_000)
+
+    return max(TARGET_SELL_FLOOR_DROPS, target_price_drops)
 
 async def populate_purchase_cost_cache(client_obj):
     """

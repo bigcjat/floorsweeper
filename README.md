@@ -102,6 +102,7 @@ Copy the generated `Secret Seed` and paste it as `XRPL_SEED` in your `.env`. Mak
 * `MAX_ACTIVE_BUYS`: The maximum number of active buy bids the bot is allowed to keep open on-ledger simultaneously (default is `4`).
 * `BUY_OFFER_EXPIRATION_SEC`: The duration in seconds before open buy offers automatically expire on-ledger (default is `600` / 10 minutes).
 * `RELIST_MARKUP_DIVISOR`: The target net profit margin divisor (default is `0.8` for a guaranteed 25% net profit margin after creator royalties and broker fees are paid).
+* `PRICE_DECIMALS`: The number of decimal places to round calculated XRP listing prices (default is `2` for clean 2-decimal prices like `12.70 XRP`; set to `0` for integer XRP prices or `6` for raw drop precision).
 * `AUTO_RELIST`: Whether to automatically list swept/bought NFTs for sale (default is `True`). Set to `False` to run the bot in "sweeping-only" mode where it only sweeps cheap NFTs without placing sell offers or managing listing prices.
 * `PRIORITY_BUY_IDS`: A comma-separated list of NFTokenIDs. If any matching NFTs are listed below your target buy ceiling, the bot will prioritize purchasing them first, even if they aren't the cheapest NFTs in the collection.
 * `HOLD_IDS`: A comma-separated list of NFTokenIDs. The bot will never automatically list/relist these NFTs for sale, and it will never automatically cancel active buy offers (bids) placed on them, allowing you to secure and hold them.
