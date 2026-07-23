@@ -491,8 +491,10 @@ async def populate_purchase_cost_cache(client_obj):
                 # Do not set a default fallback, leave it unknown so we do not list at a loss
                 print(f"[Cost Cache Warning] Failed to determine cost for owned NFT {nft_id}: {e}")
 
-        # Query history for all owned target NFTs in parallel
-        await asyncio.gather(*(fetch_cost(nft) for nft in collection_nfts))
+        # Query history for owned target NFTs with short delay to avoid node rate limiting
+        for nft in collection_nfts:
+            await fetch_cost(nft)
+            await asyncio.sleep(0.2)
 
     print(f"[Cost Cache] Initialized cache with {len(PURCHASE_COST_CACHE)} known NFT purchase costs.")
 
@@ -973,33 +975,28 @@ async def get_purchase_price_from_ledger(client_obj, http_client, nft_id):
             transactions = result.get("transactions", [])
         
         for tx_wrapper in transactions:
-            tx = tx_wrapper.get("tx", {})
-            meta = tx_wrapper.get("meta", {})
+            tx = tx_wrapper.get("tx") or tx_wrapper.get("tx_json") or {}
+            meta = tx_wrapper.get("meta") or tx_wrapper.get("metadata") or {}
             
             if meta.get("TransactionResult") == "tesSUCCESS":
-                # Look at the deleted NFTokenOffer nodes in the metadata
                 for node in meta.get("AffectedNodes", []):
                     deleted = node.get("DeletedNode", {})
                     if deleted.get("LedgerEntryType") == "NFTokenOffer":
                         fields = deleted.get("FinalFields", {})
+                        dest = fields.get("Destination")
+                        owner = fields.get("Owner")
+                        is_sell_offer = bool(fields.get("Flags", 0) & 1)
+                        account = tx.get("Account")
+                        txtype = tx.get("TransactionType")
                         
-                        # Case 1: Brokered Buy (our buy offer was consumed/deleted)
-                        # Owner is us, and it's a buy offer (Flags & 1 == 0)
-                        if (fields.get("Owner") == wallet.classic_address and 
-                            not (fields.get("Flags", 0) & 1)):
-                            amount_val = fields.get("Amount")
-                            if isinstance(amount_val, (str, int, float)):
-                                try:
-                                    return int(amount_val)
-                                except ValueError:
-                                    pass
-                        
-                        # Case 2: Direct Buy (we accepted the seller's sell offer)
-                        # The transaction was sent by us (Account is us) and we accepted this sell offer
-                        if (tx.get("TransactionType") == "NFTokenAcceptOffer" and 
-                            tx.get("Account") == wallet.classic_address and 
-                            deleted.get("LedgerIndex") == tx.get("NFTokenSellOffer")):
-                            amount_val = fields.get("Amount")
+                        # MATCH EXACT WALLET ACQUISITION:
+                        # 1. Brokered / Targeted Sell Offer to our wallet (Destination == wallet)
+                        # 2. Buy offer created by our wallet (Owner == wallet and not is_sell_offer)
+                        # 3. Direct Accept: Our wallet submitted NFTokenAcceptOffer (Account == wallet) accepting a seller offer (Owner != wallet)
+                        if (dest == wallet.classic_address or 
+                            (owner == wallet.classic_address and not is_sell_offer) or 
+                            (account == wallet.classic_address and owner != wallet.classic_address and txtype == "NFTokenAcceptOffer")):
+                            amount_val = fields.get("Amount", "0")
                             if isinstance(amount_val, (str, int, float)):
                                 try:
                                     return int(amount_val)
